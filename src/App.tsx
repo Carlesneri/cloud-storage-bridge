@@ -22,6 +22,10 @@ interface HistoryEntry {
 
 type History = Record<string, HistoryEntry>;
 
+interface SkipList {
+  [path: string]: number;
+}
+
 interface R2Config {
   account_id: string;
   access_key_id: string;
@@ -115,6 +119,7 @@ function App() {
   const [cancelling, setCancelling] = useState(false);
   const [statuses, setStatuses] = useState<Record<string, FileStatus>>({});
   const [history, setHistory] = useState<History>({});
+  const [skipList, setSkipList] = useState<SkipList>({});
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [result, setResult] = useState<UploadDoneEvent | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -130,6 +135,9 @@ function App() {
       });
     invoke<History>("get_history")
       .then((h) => setHistory(h ?? {}))
+      .catch(() => {});
+    invoke<SkipList>("get_skip_list")
+      .then((s) => setSkipList(s ?? {}))
       .catch(() => {});
   }, []);
 
@@ -200,15 +208,19 @@ function App() {
       setFolder(path);
       setScanning(true);
       setFilter("all");
-      const [media, hist] = await Promise.all([
+      const [media, hist, skip] = await Promise.all([
         invoke<MediaFile[]>("scan_folder", { path }),
         invoke<History>("get_history").catch<History>(() => ({})),
+        invoke<SkipList>("get_skip_list").catch<SkipList>(() => ({})),
       ]);
       setHistory(hist ?? {});
+      setSkipList(skip ?? {});
       const initialExcluded = new Set<string>();
       for (const f of media) {
         const h = hist[f.path];
         if (h && h.size === f.size && h.mtime === f.mtime) {
+          initialExcluded.add(f.path);
+        } else if (skip[f.path] !== undefined) {
           initialExcluded.add(f.path);
         }
       }
@@ -227,12 +239,31 @@ function App() {
   }
 
   function toggleFile(path: string) {
+    const wasSkipped = skipList[path] !== undefined;
+    const becomingIncluded = excluded.has(path);
     setExcluded((prev) => {
       const next = new Set(prev);
       if (next.has(path)) next.delete(path);
       else next.add(path);
       return next;
     });
+    if (wasSkipped && becomingIncluded) {
+      const next = { ...skipList };
+      delete next[path];
+      setSkipList(next);
+      invoke("remove_skip", { path: path }).catch(() => {});
+    }
+  }
+
+  function skipFile(path: string) {
+    setExcluded((prev) => {
+      const next = new Set(prev);
+      next.add(path);
+      return next;
+    });
+    const now = Math.floor(Date.now() / 1000);
+    setSkipList((prev) => ({ ...prev, [path]: now }));
+    invoke("add_skip", { path: path }).catch(() => {});
   }
 
   function toggleVisible(check: boolean) {
@@ -502,10 +533,11 @@ function App() {
                 const upToDate =
                   hist !== undefined && hist.size === f.size && hist.mtime === f.mtime;
                 const modified = hist !== undefined && !upToDate;
+                const skipped = skipList[f.path] !== undefined;
                 return (
                   <li
                     key={f.path}
-                    className={`file-row ${st?.state === "error" ? "file-error" : ""}`}
+                    className={`file-row ${st?.state === "error" ? "file-error" : ""} ${skipped ? "file-skipped" : ""}`}
                   >
                     <input
                       type="checkbox"
@@ -533,6 +565,14 @@ function App() {
                         Modified
                       </span>
                     )}
+                    {skipped && (
+                      <span
+                        className="tag tag-skipped"
+                        title={`Skipped ${new Date(skipList[f.path] * 1000).toLocaleString()}`}
+                      >
+                        Skipped
+                      </span>
+                    )}
                     {uploading && st ? (
                       <span className={`status status-${st.state}`}>
                         {st.state === "active" &&
@@ -544,6 +584,16 @@ function App() {
                         {st.state === "error" && (st.error ?? "Error")}
                       </span>
                     ) : null}
+                    {!uploading && !upToDate && (
+                      <button
+                        className="btn ghost btn-skip"
+                        onClick={() => skipFile(f.path)}
+                        disabled={skipped}
+                        title="Don't upload this file; remember the choice"
+                      >
+                        Skip
+                      </button>
+                    )}
                     <span className="file-size">{formatBytes(f.size)}</span>
                   </li>
                 );
