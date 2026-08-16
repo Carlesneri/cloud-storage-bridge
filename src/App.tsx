@@ -1,4 +1,5 @@
 import { useEffect, useRef, useMemo, useState } from "react";
+import logo from "./assets/app-logo.png";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
@@ -396,7 +397,7 @@ function App() {
     <main className="app">
       <header className="header">
         <div className="header-title">
-          <span className="logo" />
+          <img src={logo} className="logo" alt="Cloud Storage Bridge" />
           <div>
             <h1>Cloud Storage Bridge</h1>
             <p>Upload a folder's media to a Cloudflare R2 bucket</p>

@@ -64,8 +64,9 @@ body {
   width: 34px;
   height: 34px;
   border-radius: 10px;
-  background: linear-gradient(135deg, #f6821f, #fbad41);
-  box-shadow: 0 4px 16px rgba(246, 130, 31, 0.35);
+  object-fit: contain;
+  display: block;
+  filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.4));
 }
 
 .header h1 {
