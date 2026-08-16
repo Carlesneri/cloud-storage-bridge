@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
@@ -9,8 +9,18 @@ interface MediaFile {
   path: string;
   relative: string;
   size: number;
+  mtime: number;
   kind: MediaKind;
 }
+
+interface HistoryEntry {
+  size: number;
+  mtime: number;
+  key: string;
+  uploaded_at: number;
+}
+
+type History = Record<string, HistoryEntry>;
 
 interface R2Config {
   account_id: string;
@@ -25,9 +35,7 @@ interface UploadItem {
   path: string;
   relative: string;
   size: number;
-}
-
-interface FileStartEvent {
+}interface FileStartEvent {
   index: number;
   path: string;
   key: string;
@@ -78,19 +86,8 @@ const KIND_LABEL: Record<MediaKind, string> = {
   audio: "Audio",
 };
 
-function loadConfig(): R2Config {
-  try {
-    const saved = JSON.parse(localStorage.getItem("r2-config") ?? "{}");
-    return {
-      ...DEFAULT_CONFIG,
-      account_id: saved.account_id ?? "",
-      bucket: saved.bucket ?? "",
-      prefix: saved.prefix ?? "",
-      endpoint: saved.endpoint ?? "",
-    };
-  } catch {
-    return DEFAULT_CONFIG;
-  }
+function loadSavedConfig(): R2Config {
+  return { ...DEFAULT_CONFIG };
 }
 
 function formatBytes(bytes: number): string {
@@ -105,7 +102,8 @@ function KindBadge({ kind }: { kind: MediaKind }) {
 }
 
 function App() {
-  const [config, setConfig] = useState<R2Config>(loadConfig);
+  const [config, setConfig] = useState<R2Config>(loadSavedConfig);
+  const configLoaded = useRef(false);
   const [folder, setFolder] = useState<string | null>(null);
   const [files, setFiles] = useState<MediaFile[]>([]);
   const [excluded, setExcluded] = useState<Set<string>>(new Set());
@@ -114,15 +112,45 @@ function App() {
   const [scanError, setScanError] = useState<string | null>(null);
 
   const [uploading, setUploading] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [statuses, setStatuses] = useState<Record<string, FileStatus>>({});
+  const [history, setHistory] = useState<History>({});
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [result, setResult] = useState<UploadDoneEvent | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
 
   useEffect(() => {
-    const { access_key_id: _k, secret_access_key: _s, ...persistable } = config;
-    localStorage.setItem("r2-config", JSON.stringify(persistable));
+    invoke<R2Config | null>("load_config")
+      .then((saved) => {
+        if (saved) setConfig({ ...DEFAULT_CONFIG, ...saved });
+      })
+      .catch(() => {})
+      .finally(() => {
+        configLoaded.current = true;
+      });
+    invoke<History>("get_history")
+      .then((h) => setHistory(h ?? {}))
+      .catch(() => {});
+  }, []);
+
+  // Persist the non-secret settings whenever they change.
+  useEffect(() => {
+    if (!configLoaded.current) return;
+    invoke("save_config", { config }).catch(() => {});
   }, [config]);
+
+  // Persist the secret to the OS keychain, but only when the user actually
+  // types one — leaving the field blank means "use the stored one". Writes are
+  // debounced so the keychain prompt appears at most once per edit.
+  useEffect(() => {
+    if (!configLoaded.current) return;
+    const secret = config.secret_access_key.trim();
+    if (secret.length === 0) return; // never overwrite stored with empty
+    const timer = setTimeout(() => {
+      invoke("save_secret", { secret: config.secret_access_key }).catch(() => {});
+    }, 700);
+    return () => clearTimeout(timer);
+  }, [config.secret_access_key]);
 
   const counts = useMemo(() => {
     const c = { all: 0, image: 0, video: 0, audio: 0 } as Record<"all" | MediaKind, number>;
@@ -157,8 +185,9 @@ function App() {
   const configValid =
     config.bucket.trim().length > 0 &&
     config.access_key_id.trim().length > 0 &&
-    config.secret_access_key.trim().length > 0 &&
     (config.account_id.trim().length > 0 || config.endpoint.trim().length > 0);
+
+  const hasCredentials = Object.values(config).some((v) => v.trim().length > 0);
 
   async function pickFolder() {
     setScanError(null);
@@ -170,9 +199,20 @@ function App() {
       if (!path) return;
       setFolder(path);
       setScanning(true);
-      setExcluded(new Set());
       setFilter("all");
-      const media = await invoke<MediaFile[]>("scan_folder", { path });
+      const [media, hist] = await Promise.all([
+        invoke<MediaFile[]>("scan_folder", { path }),
+        invoke<History>("get_history").catch<History>(() => ({})),
+      ]);
+      setHistory(hist ?? {});
+      const initialExcluded = new Set<string>();
+      for (const f of media) {
+        const h = hist[f.path];
+        if (h && h.size === f.size && h.mtime === f.mtime) {
+          initialExcluded.add(f.path);
+        }
+      }
+      setExcluded(initialExcluded);
       setFiles(media);
       if (media.length === 0) {
         setScanError("No media files found in this folder.");
@@ -207,6 +247,8 @@ function App() {
   }
 
   async function cancelUpload() {
+    if (cancelling) return;
+    setCancelling(true);
     try {
       await invoke("cancel_upload");
     } catch {
@@ -222,16 +264,33 @@ function App() {
     }));
     if (items.length === 0 || uploading) return;
 
+    // The secret is stored in the OS keychain, not the React state — fetch it
+    // lazily so a keychain prompt never appears on app launch.
+    let secret = config.secret_access_key.trim();
+    if (secret.length === 0) {
+      const stored = await invoke<string | null>("load_secret").catch<null>(() => null);
+      secret = (stored ?? "").trim();
+    }
+    if (secret.length === 0) {
+      setCommandError("Enter your R2 Secret Access Key to upload.");
+      return;
+    }
+
     const initial: Record<string, FileStatus> = {};
     for (const f of selected) initial[f.path] = { state: "pending", uploaded: 0 };
     setStatuses(initial);
     setResult(null);
     setCommandError(null);
     setActiveKey(null);
+    setCancelling(false);
     setUploading(true);
+
+    const metaByPath = new Map(selected.map((f) => [f.path, f]));
+    const keyByPath = new Map<string, string>();
 
     const unlistens: UnlistenFn[] = await Promise.all([
       listen<FileStartEvent>("upload://file-start", (e) => {
+        keyByPath.set(e.payload.path, e.payload.key);
         setStatuses((prev) => ({
           ...prev,
           [e.payload.path]: { state: "active", uploaded: 0 },
@@ -249,11 +308,21 @@ function App() {
         });
       }),
       listen<FileDoneEvent>("upload://file-done", (e) => {
+        const meta = metaByPath.get(e.payload.path);
         setStatuses((prev) => {
           const cur = prev[e.payload.path];
           if (!cur) return prev;
           return { ...prev, [e.payload.path]: { state: "done", uploaded: cur.uploaded } };
         });
+        setHistory((prev) => ({
+          ...prev,
+          [e.payload.path]: {
+            size: meta?.size ?? 0,
+            mtime: meta?.mtime ?? 0,
+            key: keyByPath.get(e.payload.path) ?? "",
+            uploaded_at: Math.floor(Date.now() / 1000),
+          },
+        }));
       }),
       listen<FileErrorEvent>("upload://file-error", (e) => {
         setStatuses((prev) => {
@@ -274,8 +343,9 @@ function App() {
 
     try {
       const done = await invoke<UploadDoneEvent>("upload_files", {
-        config,
+        config: { ...config, secret_access_key: secret },
         items,
+        root: folder,
       });
       setResult(done);
     } catch (e) {
@@ -284,6 +354,7 @@ function App() {
       for (const u of unlistens) u();
       setUploading(false);
       setActiveKey(null);
+      setCancelling(false);
     }
   }
 
@@ -303,7 +374,22 @@ function App() {
       </header>
 
       <section className="card">
-        <h2>Destination</h2>
+        <div className="card-header">
+          <h2>Destination</h2>
+          {hasCredentials && (
+            <button
+              className="btn ghost btn-clear-creds"
+              onClick={() => {
+                setConfig({ ...DEFAULT_CONFIG });
+                invoke("save_secret", { secret: "" }).catch(() => {});
+              }}
+              disabled={uploading}
+              title="Clear all fields and remove the saved secret from the OS keychain"
+            >
+              Clear credentials
+            </button>
+          )}
+        </div>
         <div className="config-grid">
           <label>
             Account ID
@@ -334,14 +420,14 @@ function App() {
             />
           </label>
           <label>
-            Secret Access Key
+            Secret Access Key <span className="optional">stored in keychain</span>
             <input
               type="password"
               value={config.secret_access_key}
               onChange={(e) =>
                 setConfig({ ...config, secret_access_key: e.target.value })
               }
-              placeholder="R2 secret access key"
+              placeholder="Leave blank to use the saved key"
               autoComplete="off"
             />
           </label>
@@ -412,6 +498,10 @@ function App() {
               {visible.map((f) => {
                 const st = statuses[f.path];
                 const included = !excluded.has(f.path);
+                const hist = history[f.path];
+                const upToDate =
+                  hist !== undefined && hist.size === f.size && hist.mtime === f.mtime;
+                const modified = hist !== undefined && !upToDate;
                 return (
                   <li
                     key={f.path}
@@ -427,6 +517,22 @@ function App() {
                     <span className="file-name" title={f.path}>
                       {f.relative}
                     </span>
+                    {upToDate && (
+                      <span
+                        className="tag tag-uploaded"
+                        title={`Uploaded ${new Date(hist.uploaded_at * 1000).toLocaleString()}`}
+                      >
+                        Uploaded
+                      </span>
+                    )}
+                    {modified && (
+                      <span
+                        className="tag tag-modified"
+                        title="File changed since last upload"
+                      >
+                        Modified
+                      </span>
+                    )}
                     {uploading && st ? (
                       <span className={`status status-${st.state}`}>
                         {st.state === "active" &&
@@ -462,8 +568,8 @@ function App() {
           </div>
           <div className="upload-actions">
             {uploading ? (
-              <button className="btn danger" onClick={cancelUpload}>
-                Cancel
+              <button className="btn danger" onClick={cancelUpload} disabled={cancelling}>
+                {cancelling ? "Cancelling..." : "Cancel"}
               </button>
             ) : (
               <button

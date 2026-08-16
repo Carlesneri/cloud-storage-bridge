@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "cloud-storage-bridge",
+  "productName": "Cloud Storage Bridge",
   "version": "0.1.0",
   "identifier": "com.carlesneri.cloud-storage-bridge",
   "build": {
@@ -18,7 +18,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src ipc: http://ipc.localhost ws://localhost:1420 ws://localhost:1421; object-src 'none'; base-uri 'none'"
     }
   },
   "bundle": {
