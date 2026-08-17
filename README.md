@@ -10,9 +10,25 @@ Works on **macOS, Windows and Linux**.
 - Native folder picker, recursive scan (hidden files/folders are skipped)
 - Media detection by extension: images (jpg, png, heic, webp, ...), video (mp4, mov, mkv, ...),
   and audio (mp3, wav, flac, ...)
+- Automatic video preparation (ffmpeg sidecar) so every uploaded video plays in a
+  standard browser `<video>` player, with subtitles:
+  - H.264 + AAC in MKV/WebM/AVI → remuxed to MP4 (`-c copy`, no re-encode)
+  - H.264 with AC3/EAC3/DTS/other audio → video copied, audio transcoded to AAC 192k
+  - HEVC/VP9/AV1/other → full transcode to H.264 + AAC, using the GPU
+    (VideoToolbox on macOS, NVENC/QuickSync/AMF elsewhere) when available,
+    with a CPU `libx264` fallback; CPU transcodes are thread-capped so they
+    don't overheat the machine
+  - all outputs use `-movflags +faststart` for instant streaming
+  - every subtitle track is extracted as a WebVTT sidecar uploaded next to the
+    video: `<name>.vtt` (default) and `<name>.<lang>.vtt` (per language);
+    image-based subtitles (PGS/VOBSUB) are skipped, and an external `.srt`/`.vtt`
+    with the same base name is used instead of embedded tracks when present
+  - if ffmpeg fails, the original file is uploaded and flagged
+    "may not play in browser"
 - Uploads via R2's S3-compatible API: single PUT for small files, multipart with
   per-part progress and retries for large files
-- Per-file and overall progress, kind filters, file selection, cancel support
+- Per-file and overall progress (including a "preparing" phase with ffmpeg
+  progress), kind filters, file selection, cancel support
 - Files are stored under their relative folder path, with an optional key prefix
 - Credentials are remembered between sessions (secret key in the OS keychain)
 - Upload history: previously uploaded files start deselected with an "Uploaded" tag;
@@ -27,6 +43,18 @@ Works on **macOS, Windows and Linux**.
    ```
    pnpm install
    ```
+
+2. Fetch the bundled ffmpeg/ffprobe sidecar binaries (once per machine; they
+   are not committed to the repo):
+
+   ```
+   ./scripts/fetch-ffmpeg.sh
+   ```
+
+   The script downloads static builds for the current platform into
+   `src-tauri/binaries/`. Use `./scripts/fetch-ffmpeg.sh all` to fetch every
+   supported target (macOS x86_64/arm64, Linux x86_64/arm64, Windows x86_64)
+   before cross-building release bundles.
 
 2. In Cloudflare, create an R2 bucket and an R2 API token with
    **Object Read & Write** permission

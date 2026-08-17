@@ -106,8 +106,49 @@ body {
   margin-bottom: 14px;
 }
 
+/* Collapsed destination card: no content below the header, drop its spacing */
+.card:has(.collapse-toggle[aria-expanded="false"]) .card-header {
+  margin-bottom: 0;
+}
+
 .card-header h2 {
   margin: 0;
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+}
+
+.collapse-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.collapse-toggle:hover {
+  color: var(--text);
+}
+
+.chevron {
+  display: inline-block;
+  font-size: 28px;
+  line-height: 1;
+  transition: transform 0.15s ease;
+}
+
+.chevron-open {
+  transform: rotate(90deg);
 }
 
 .btn-clear-creds {
@@ -387,6 +428,11 @@ input[type="checkbox"] {
   color: var(--muted);
 }
 
+.tag-warn {
+  background: rgba(229, 72, 77, 0.14);
+  color: var(--danger);
+}
+
 .file-skipped {
   opacity: 0.6;
 }
@@ -426,6 +472,10 @@ input[type="checkbox"] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.status-preparing {
+  color: var(--video);
 }
 
 .status-active {

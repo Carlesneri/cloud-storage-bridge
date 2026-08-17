@@ -56,6 +56,7 @@ interface FileProgressEvent {
 interface FileDoneEvent {
   index: number;
   path: string;
+  warning?: string;
 }
 
 interface FileErrorEvent {
@@ -70,9 +71,26 @@ interface UploadDoneEvent {
   cancelled: boolean;
 }
 
+interface PrepareStartEvent {
+  index: number;
+  path: string;
+  action: string;
+  duration: number;
+}
+
+interface PrepareProgressEvent {
+  index: number;
+  path: string;
+  seconds: number;
+  duration: number;
+}
+
 interface FileStatus {
-  state: "pending" | "active" | "done" | "error";
+  state: "pending" | "preparing" | "active" | "done" | "error";
   uploaded: number;
+  action?: string;
+  preparePct?: number;
+  warning?: string;
   error?: string;
 }
 
@@ -118,6 +136,7 @@ function App() {
 
   const [uploading, setUploading] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [destOpen, setDestOpen] = useState(false);
   const [statuses, setStatuses] = useState<Record<string, FileStatus>>({});
   const [history, setHistory] = useState<History>({});
   const [skipList, setSkipList] = useState<SkipList>({});
@@ -186,7 +205,9 @@ function App() {
     let sum = 0;
     for (const f of selected) {
       const st = statuses[f.path];
-      if (st) sum += Math.min(st.uploaded, f.size);
+      if (!st) continue;
+      if (st.state === "done") sum += f.size;
+      else sum += Math.min(st.uploaded, f.size);
     }
     return sum;
   }, [selected, statuses]);
@@ -321,6 +342,32 @@ function App() {
     const keyByPath = new Map<string, string>();
 
     const unlistens: UnlistenFn[] = await Promise.all([
+      listen<PrepareStartEvent>("upload://prepare-start", (e) => {
+        setStatuses((prev) => {
+          const cur = prev[e.payload.path];
+          if (!cur) return prev;
+          return {
+            ...prev,
+            [e.payload.path]: {
+              ...cur,
+              state: "preparing",
+              action: e.payload.action,
+              preparePct: 0,
+            },
+          };
+        });
+      }),
+      listen<PrepareProgressEvent>("upload://prepare-progress", (e) => {
+        setStatuses((prev) => {
+          const cur = prev[e.payload.path];
+          if (!cur || cur.state !== "preparing") return prev;
+          const pct =
+            e.payload.duration > 0
+              ? Math.min(100, Math.round((e.payload.seconds / e.payload.duration) * 100))
+              : 0;
+          return { ...prev, [e.payload.path]: { ...cur, preparePct: pct } };
+        });
+      }),
       listen<FileStartEvent>("upload://file-start", (e) => {
         keyByPath.set(e.payload.path, e.payload.key);
         setStatuses((prev) => ({
@@ -344,7 +391,14 @@ function App() {
         setStatuses((prev) => {
           const cur = prev[e.payload.path];
           if (!cur) return prev;
-          return { ...prev, [e.payload.path]: { state: "done", uploaded: cur.uploaded } };
+          return {
+            ...prev,
+            [e.payload.path]: {
+              state: "done",
+              uploaded: cur.uploaded,
+              warning: e.payload.warning,
+            },
+          };
         });
         setHistory((prev) => ({
           ...prev,
@@ -407,7 +461,16 @@ function App() {
 
       <section className="card">
         <div className="card-header">
-          <h2>Destination</h2>
+          <h2 className="card-title">
+            <button
+              className="collapse-toggle"
+              onClick={() => setDestOpen((open) => !open)}
+              aria-expanded={destOpen}
+            >
+              <span className={`chevron ${destOpen ? "chevron-open" : ""}`}>▸</span>
+              Destination
+            </button>
+          </h2>
           {hasCredentials && (
             <button
               className="btn ghost btn-clear-creds"
@@ -422,7 +485,8 @@ function App() {
             </button>
           )}
         </div>
-        <div className="config-grid">
+        {destOpen && (
+          <div className="config-grid">
           <label>
             Account ID
             <input
@@ -482,6 +546,7 @@ function App() {
             />
           </label>
         </div>
+        )}
         {!configValid && (
           <p className="hint">
             Fill in your R2 account ID, credentials and bucket to enable uploads.
@@ -517,10 +582,10 @@ function App() {
                 ))}
               </div>
               <div className="toolbar-actions">
-                <button className="btn ghost" onClick={() => toggleVisible(true)}>
+                <button className="btn ghost" onClick={() => toggleVisible(true)} disabled={uploading}>
                   Select all
                 </button>
-                <button className="btn ghost" onClick={() => toggleVisible(false)}>
+                <button className="btn ghost" onClick={() => toggleVisible(false)} disabled={uploading}>
                   Deselect all
                 </button>
               </div>
@@ -574,8 +639,15 @@ function App() {
                         Skipped
                       </span>
                     )}
+                    {st?.warning && (
+                      <span className="tag tag-warn" title={st.warning}>
+                        May not play in browser
+                      </span>
+                    )}
                     {uploading && st ? (
                       <span className={`status status-${st.state}`}>
+                        {st.state === "preparing" &&
+                          `${st.action ?? "preparing"}${st.preparePct ? ` ${st.preparePct}%` : ""}`}
                         {st.state === "active" &&
                           `${Math.floor(
                             (Math.min(st.uploaded, f.size) / Math.max(f.size, 1)) * 100,

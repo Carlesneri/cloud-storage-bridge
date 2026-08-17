@@ -25,3 +25,6 @@ dist-ssr
 
 .env
 .env.*
+
+# Bundled ffmpeg/ffprobe sidecar binaries (fetch with scripts/fetch-ffmpeg.sh)
+src-tauri/binaries/

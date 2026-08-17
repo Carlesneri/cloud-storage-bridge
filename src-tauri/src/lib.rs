@@ -17,6 +17,10 @@ use tauri_plugin_dialog::DialogExt;
 use tokio::io::AsyncReadExt;
 use walkdir::WalkDir;
 
+mod video;
+
+use video::{Prepared, MAY_NOT_PLAY};
+
 const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "avif", "svg",
     "ico", "jfif",
@@ -97,6 +101,8 @@ struct FileProgressEvent {
 struct FileDoneEvent {
     index: usize,
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -364,11 +370,27 @@ fn build_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient
     aws_smithy_runtime_api::client::http::http_client_fn(move |_, _| connector.clone())
 }
 
+fn content_type_for(path: &Path) -> String {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("vtt"))
+    {
+        return "text/vtt".to_string();
+    }
+    mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn upload_one(
     app: &AppHandle,
     client: &Client,
     bucket: &str,
-    item: &UploadItem,
+    src_path: &str,
+    disk_path: &Path,
+    size: u64,
     index: usize,
     key: &str,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -377,13 +399,10 @@ async fn upload_one(
         return Err(CANCELLED.to_string());
     }
 
-    let path = Path::new(&item.path);
-    let content_type = mime_guess::from_path(path)
-        .first_or_octet_stream()
-        .to_string();
+    let content_type = content_type_for(disk_path);
 
-    if item.size <= SMALL_FILE_LIMIT {
-        let data = tokio::fs::read(path)
+    if size <= SMALL_FILE_LIMIT {
+        let data = tokio::fs::read(disk_path)
             .await
             .map_err(|e| format!("read error: {e}"))?;
         let len = data.len() as u64;
@@ -405,16 +424,16 @@ async fn upload_one(
             }),
         )
         .await?;
-        emit_progress(app, index, &item.path, len);
+        emit_progress(app, index, src_path, len);
         return Ok(());
     }
 
     // Multipart upload for large files, with per-part progress and retry.
-    let file = tokio::fs::File::open(path)
+    let file = tokio::fs::File::open(disk_path)
         .await
         .map_err(|e| format!("open error: {e}"))?;
     let mut reader = tokio::io::BufReader::with_capacity(1024 * 1024, file);
-    let part_size = part_size_for(item.size);
+    let part_size = part_size_for(size);
 
     let mpu = cancelable(
         &mut cancel_rx,
@@ -447,7 +466,8 @@ async fn upload_one(
         key,
         &upload_id,
         &mut reader,
-        item,
+        src_path,
+        size,
         index,
         part_size,
         &mut cancel_rx,
@@ -478,7 +498,7 @@ async fn upload_one(
             .await;
             match result {
                 Ok(_) => {
-                    emit_progress(app, index, &item.path, item.size);
+                    emit_progress(app, index, src_path, size);
                     Ok(())
                 }
                 Err(e) => {
@@ -512,7 +532,8 @@ async fn upload_parts(
     key: &str,
     upload_id: &str,
     reader: &mut (impl AsyncReadExt + Unpin),
-    item: &UploadItem,
+    src_path: &str,
+    size: u64,
     index: usize,
     part_size: u64,
     cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -521,12 +542,12 @@ async fn upload_parts(
     let mut uploaded: u64 = 0;
     let mut part_number: i32 = 1;
 
-    while uploaded < item.size {
+    while uploaded < size {
         if *cancel_rx.borrow_and_update() {
             return Err(CANCELLED.to_string());
         }
 
-        let this_len = part_size.min(item.size - uploaded) as usize;
+        let this_len = part_size.min(size - uploaded) as usize;
         let mut buf = vec![0u8; this_len];
         reader
             .read_exact(&mut buf)
@@ -561,11 +582,40 @@ async fn upload_parts(
         );
 
         uploaded += this_len as u64;
-        emit_progress(app, index, &item.path, uploaded);
+        emit_progress(app, index, src_path, uploaded);
         part_number += 1;
     }
 
     Ok(parts)
+}
+
+/// Small single-PUT upload for subtitle sidecar files.
+async fn upload_sidecar(
+    client: &Client,
+    bucket: &str,
+    path: &Path,
+    key: &str,
+) -> Result<(), String> {
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("read error: {e}"))?;
+    let content_type = content_type_for(path);
+    with_retry(|| {
+        let body = ByteStream::from(data.clone());
+        async {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .content_type(&content_type)
+                .body(body)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| error_chain(&e))
+        }
+    })
+    .await
 }
 
 /// Make sure a user-provided endpoint is an absolute URL: hyper rejects
@@ -646,6 +696,7 @@ async fn upload_files(
     let mut failed_count = 0usize;
     let mut cancelled = false;
     let mut history = read_history(&app);
+    let sidecars = video::resolve_sidecars();
 
     for (index, item) in items.iter().enumerate() {
         if *rx.borrow_and_update() {
@@ -671,10 +722,86 @@ async fn upload_files(
         }
 
         let rel = item.relative.trim_start_matches('/');
-        let key = if prefix.is_empty() {
-            rel.to_string()
+
+        // Videos are prepared for browser playback (remux/transcode plus
+        // WebVTT subtitle sidecars) before uploading; everything else goes
+        // up as-is.
+        let is_video = Path::new(&item.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| kind_for_ext(&e.to_ascii_lowercase()) == Some(MediaKind::Video))
+            .unwrap_or(false);
+
+        let mut prepared: Option<Prepared> = None;
+        if is_video {
+            let outcome = match &sidecars {
+                Some(sc) => {
+                    video::prepare_video_emitting(
+                        &app,
+                        sc,
+                        Path::new(&item.path),
+                        &item.relative,
+                        index,
+                        &item.path,
+                        &mut rx,
+                    )
+                    .await
+                }
+                None => Ok(Prepared {
+                    file: PathBuf::from(&item.path),
+                    size: item.size,
+                    warning: Some(MAY_NOT_PLAY.to_string()),
+                    temp_dir: None,
+                    sidecars: Vec::new(),
+                }),
+            };
+            match outcome {
+                Ok(p) => prepared = Some(p),
+                Err(e) if e == CANCELLED => {
+                    let _ = app.emit(
+                        "upload://file-error",
+                        FileErrorEvent {
+                            index,
+                            path: item.path.clone(),
+                            error: CANCELLED.to_string(),
+                        },
+                    );
+                    cancelled = true;
+                    break;
+                }
+                Err(e) => {
+                    let _ = app.emit(
+                        "upload://file-error",
+                        FileErrorEvent {
+                            index,
+                            path: item.path.clone(),
+                            error: e,
+                        },
+                    );
+                    failed_count += 1;
+                    continue;
+                }
+            }
+        }
+
+        let prepared = prepared.unwrap_or(Prepared {
+            file: PathBuf::from(&item.path),
+            size: item.size,
+            warning: None,
+            temp_dir: None,
+            sidecars: Vec::new(),
+        });
+
+        // A converted video keeps its name, only with a .mp4 extension.
+        let mp4_rel = if prepared.file != Path::new(&item.path) {
+            video::mp4_key(rel)
         } else {
-            format!("{prefix}/{rel}")
+            rel.to_string()
+        };
+        let key = if prefix.is_empty() {
+            mp4_rel.clone()
+        } else {
+            format!("{prefix}/{mp4_rel}")
         };
 
         let _ = app.emit(
@@ -683,11 +810,45 @@ async fn upload_files(
                 index,
                 path: item.path.clone(),
                 key: key.clone(),
-                size: item.size,
+                size: prepared.size,
             },
         );
 
-        match upload_one(&app, &client, &bucket, item, index, &key, rx.clone()).await {
+        let upload_result = upload_one(
+            &app,
+            &client,
+            &bucket,
+            &item.path,
+            &prepared.file,
+            prepared.size,
+            index,
+            &key,
+            rx.clone(),
+        )
+        .await;
+
+        // Subtitle sidecars go up next to the video, sharing its base name.
+        let mut warning = prepared.warning.clone();
+        if upload_result.is_ok() && !prepared.sidecars.is_empty() {
+            let stem = video::key_stem(&key);
+            for (sidecar_path, suffix) in &prepared.sidecars {
+                let sidecar_key = if suffix.is_empty() {
+                    format!("{stem}.vtt")
+                } else {
+                    format!("{stem}.{suffix}.vtt")
+                };
+                if let Err(e) = upload_sidecar(&client, &bucket, sidecar_path, &sidecar_key).await
+                {
+                    warning = warning.or(Some(format!("subtitles not uploaded: {e}")));
+                }
+            }
+        }
+
+        if let Some(temp_dir) = &prepared.temp_dir {
+            let _ = tokio::fs::remove_dir_all(temp_dir).await;
+        }
+
+        match upload_result {
             Ok(()) => {
                 let mtime = tokio::fs::metadata(&item.path)
                     .await
@@ -714,6 +875,7 @@ async fn upload_files(
                     FileDoneEvent {
                         index,
                         path: item.path.clone(),
+                        warning,
                     },
                 );
                 uploaded_count += 1;
