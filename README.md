@@ -10,7 +10,8 @@ Works on **macOS, Windows and Linux**.
 - Native folder picker, recursive scan (hidden files/folders are skipped)
 - Media detection by extension: images (jpg, png, heic, webp, ...), video (mp4, mov, mkv, ...),
   and audio (mp3, wav, flac, ...)
-- Automatic video preparation (ffmpeg sidecar) so every uploaded video plays in a
+- Optional per-file video preparation (toggle in each video's row, off by
+  default; resets once the file is uploaded) so every uploaded video plays in a
   standard browser `<video>` player, with subtitles:
   - H.264 + AAC in MKV/WebM/AVI → remuxed to MP4 (`-c copy`, no re-encode)
   - H.264 with AC3/EAC3/DTS/other audio → video copied, audio transcoded to AAC 192k

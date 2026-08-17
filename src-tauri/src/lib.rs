@@ -80,6 +80,8 @@ struct UploadItem {
     path: String,
     relative: String,
     size: u64,
+    #[serde(default)]
+    transcode: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -696,7 +698,11 @@ async fn upload_files(
     let mut failed_count = 0usize;
     let mut cancelled = false;
     let mut history = read_history(&app);
-    let sidecars = video::resolve_sidecars();
+    let sidecars = if items.iter().any(|i| i.transcode) {
+        video::resolve_sidecars()
+    } else {
+        None
+    };
 
     for (index, item) in items.iter().enumerate() {
         if *rx.borrow_and_update() {
@@ -723,14 +729,15 @@ async fn upload_files(
 
         let rel = item.relative.trim_start_matches('/');
 
-        // Videos are prepared for browser playback (remux/transcode plus
-        // WebVTT subtitle sidecars) before uploading; everything else goes
-        // up as-is.
-        let is_video = Path::new(&item.path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| kind_for_ext(&e.to_ascii_lowercase()) == Some(MediaKind::Video))
-            .unwrap_or(false);
+        // Videos marked with the per-row toggle are prepared for browser
+        // playback (remux/transcode plus WebVTT subtitle sidecars) before
+        // uploading; everything else goes up as-is.
+        let is_video = item.transcode
+            && Path::new(&item.path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| kind_for_ext(&e.to_ascii_lowercase()) == Some(MediaKind::Video))
+                .unwrap_or(false);
 
         let mut prepared: Option<Prepared> = None;
         if is_video {

@@ -514,6 +514,52 @@ input[type="checkbox"] {
   color: var(--muted);
 }
 
+/* Per-row "prepare for browser playback" toggle */
+input.switch {
+  appearance: none;
+  position: relative;
+  width: 30px;
+  height: 17px;
+  padding: 0;
+  flex-shrink: 0;
+  background: var(--card-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+input.switch::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition:
+    transform 0.15s ease,
+    background 0.15s;
+}
+
+input.switch:checked {
+  background: rgba(246, 130, 31, 0.25);
+  border-color: var(--accent);
+}
+
+input.switch:checked::after {
+  transform: translateX(13px);
+  background: var(--accent);
+}
+
+input.switch:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .active-key {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 12px;

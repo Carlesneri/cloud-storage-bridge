@@ -40,6 +40,7 @@ interface UploadItem {
   path: string;
   relative: string;
   size: number;
+  transcode: boolean;
 }interface FileStartEvent {
   index: number;
   path: string;
@@ -137,6 +138,7 @@ function App() {
   const [uploading, setUploading] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [destOpen, setDestOpen] = useState(false);
+  const [transcodeSet, setTranscodeSet] = useState<Set<string>>(new Set());
   const [statuses, setStatuses] = useState<Record<string, FileStatus>>({});
   const [history, setHistory] = useState<History>({});
   const [skipList, setSkipList] = useState<SkipList>({});
@@ -314,6 +316,7 @@ function App() {
       path: f.path,
       relative: f.relative,
       size: f.size,
+      transcode: f.kind === "video" && transcodeSet.has(f.path),
     }));
     if (items.length === 0 || uploading) return;
 
@@ -399,6 +402,13 @@ function App() {
               warning: e.payload.warning,
             },
           };
+        });
+        // Once uploaded, the file no longer needs preparation next time.
+        setTranscodeSet((prev) => {
+          if (!prev.has(e.payload.path)) return prev;
+          const next = new Set(prev);
+          next.delete(e.payload.path);
+          return next;
         });
         setHistory((prev) => ({
           ...prev,
@@ -638,6 +648,24 @@ function App() {
                       >
                         Skipped
                       </span>
+                    )}
+                    {f.kind === "video" && (
+                      <input
+                        type="checkbox"
+                        className="switch"
+                        role="switch"
+                        checked={transcodeSet.has(f.path)}
+                        onChange={() =>
+                          setTranscodeSet((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(f.path)) next.delete(f.path);
+                            else next.add(f.path);
+                            return next;
+                          })
+                        }
+                        disabled={uploading}
+                        title="Prepare for browser playback (H.264 MP4 + WebVTT subtitles)"
+                      />
                     )}
                     {st?.warning && (
                       <span className="tag tag-warn" title={st.warning}>
