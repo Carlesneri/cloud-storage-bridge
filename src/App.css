@@ -289,6 +289,30 @@ input[type="checkbox"] {
   border-color: var(--border);
 }
 
+.btn-del {
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 14px;
+  cursor: pointer;
+  color: var(--muted);
+  justify-self: center;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.btn-del:hover:not(:disabled) {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.1);
+}
+
+.btn-del:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
 .toolbar {
   display: flex;
   align-items: center;
@@ -343,19 +367,61 @@ input[type="checkbox"] {
 .file-list {
   list-style: none;
   margin: 0;
-  padding: 0;
+  padding: 0 12px;
   max-height: 340px;
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--card-2);
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto 30px 30px auto 64px 32px;
+  gap: 0 10px;
+}
+
+.file-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+  padding: 7px 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  user-select: none;
+}
+
+.file-header:last-child {
+  border-bottom: 1px solid var(--border);
+}
+
+.file-header span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-header .file-name {
+  color: var(--muted);
+}
+
+.file-header .col-transcript,
+.file-header .col-skip,
+.file-header .col-remove {
+  text-align: center;
+  justify-self: center;
 }
 
 .file-row {
-  display: flex;
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
   align-items: center;
   gap: 10px;
-  padding: 8px 12px;
+  padding: 8px 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.04);
 }
 
@@ -367,39 +433,35 @@ input[type="checkbox"] {
   background: rgba(229, 72, 77, 0.07);
 }
 
-.badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
-  font-size: 11px;
-  font-weight: 700;
-  flex-shrink: 0;
+.file-row:not(.file-header):hover {
+  background: rgba(255, 255, 255, 0.025);
 }
 
-.badge-image {
-  background: rgba(79, 156, 249, 0.15);
-  color: var(--image);
-}
-
-.badge-video {
-  background: rgba(181, 123, 239, 0.15);
-  color: var(--video);
-}
-
-.badge-audio {
-  background: rgba(62, 207, 142, 0.15);
-  color: var(--audio);
+.file-row:not(.file-header):has(.btn-del:hover) {
+  background: transparent;
 }
 
 .file-name {
-  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 13px;
+}
+
+.row-tags {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  flex-wrap: wrap;
+}
+
+.row-state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 220px;
 }
 
 .tag {
@@ -437,31 +499,12 @@ input[type="checkbox"] {
   opacity: 0.6;
 }
 
-.btn-skip {
-  padding: 2px 9px;
-  font-size: 11.5px;
-  font-weight: 550;
-  border-radius: 6px;
-  color: var(--muted);
-  flex-shrink: 0;
-}
-
-.btn-skip:hover:not(:disabled) {
-  color: var(--text);
-  background: rgba(255, 255, 255, 0.06);
-  border-color: transparent;
-}
-
-.btn-skip:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-
 .file-size {
   color: var(--muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
-  flex-shrink: 0;
+  text-align: right;
+  justify-self: end;
 }
 
 .status {
@@ -522,6 +565,7 @@ input.switch {
   height: 17px;
   padding: 0;
   flex-shrink: 0;
+  justify-self: center;
   background: var(--card-2);
   border: 1px solid var(--border);
   border-radius: 999px;

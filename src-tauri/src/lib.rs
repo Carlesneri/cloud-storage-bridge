@@ -979,6 +979,11 @@ fn clear_history(app: AppHandle) -> Result<(), String> {
     write_history(&app, &HashMap::new())
 }
 
+#[tauri::command]
+fn delete_file(path: String) -> Result<(), String> {
+    std::fs::remove_file(&path).map_err(|e| format!("failed to delete: {e}"))
+}
+
 fn skip_list_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -1329,6 +1334,7 @@ pub fn run() {
             load_secret,
             get_history,
             clear_history,
+            delete_file,
             get_skip_list,
             add_skip,
             remove_skip
