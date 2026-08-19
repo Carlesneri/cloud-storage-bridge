@@ -121,6 +121,12 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`
 }
 
+const DELETE_KEY = "delete-after-upload"
+
+function loadDeletePref(): boolean {
+  return localStorage.getItem(DELETE_KEY) === "1"
+}
+
 function App() {
   const [config, setConfig] = useState<R2Config>(loadSavedConfig)
   const configLoaded = useRef(false)
@@ -135,6 +141,7 @@ function App() {
   const [cancelling, setCancelling] = useState(false)
   const [destOpen, setDestOpen] = useState(false)
   const [transcodeSet, setTranscodeSet] = useState<Set<string>>(new Set())
+  const [deleteAfterUpload, setDeleteAfterUpload] = useState(loadDeletePref)
   const [statuses, setStatuses] = useState<Record<string, FileStatus>>({})
   const [history, setHistory] = useState<History>({})
   const [skipList, setSkipList] = useState<SkipList>({})
@@ -158,6 +165,11 @@ function App() {
       .then((s) => setSkipList(s ?? {}))
       .catch(() => { })
   }, [])
+
+  // Persist the delete-after-upload preference.
+  useEffect(() => {
+    localStorage.setItem(DELETE_KEY, deleteAfterUpload ? "1" : "0")
+  }, [deleteAfterUpload])
 
   // Persist the non-secret settings whenever they change.
   useEffect(() => {
@@ -237,7 +249,12 @@ function App() {
       setSkipList(skip ?? {})
       const initialExcluded = new Set<string>()
       for (const f of media) {
-        initialExcluded.add(f.path)
+        const h = hist[f.path]
+        if (h && h.size === f.size && h.mtime === f.mtime) {
+          initialExcluded.add(f.path)
+        } else if (skip[f.path] !== undefined) {
+          initialExcluded.add(f.path)
+        }
       }
       setExcluded(initialExcluded)
       setFiles(media)
@@ -282,11 +299,6 @@ function App() {
   }
 
   function unskipFile(path: string) {
-    setExcluded((prev) => {
-      const next = new Set(prev)
-      next.delete(path)
-      return next
-    })
     setSkipList((prev) => {
       const next = { ...prev }
       delete next[path]
@@ -447,6 +459,7 @@ function App() {
         config: { ...config, secret_access_key: secret },
         items,
         root: folder,
+        deleteAfterUpload,
       })
       setResult(done)
     } catch (e) {
@@ -607,148 +620,152 @@ function App() {
               </div>
             </div>
 
-            <ul className="file-list">
-              <li className="file-row file-header">
-                <span />
-                <span className="file-name">Name</span>
-                <span />
-                <span className="col-transcript">Transcript</span>
-                <span className="col-skip">Skip</span>
-                <span />
-                <span className="file-size">Size</span>
-                <span className="col-remove">Remove</span>
-              </li>
-              {visible.map((f) => {
-                const st = statuses[f.path]
-                const included = !excluded.has(f.path)
-                const hist = history[f.path]
-                const upToDate =
-                  hist !== undefined && hist.size === f.size && hist.mtime === f.mtime
-                const modified = hist !== undefined && !upToDate
-                const skipped = skipList[f.path] !== undefined
-                return (
-                  <li
-                    key={f.path}
-                    className={`file-row ${st?.state === "error" ? "file-error" : ""} ${skipped ? "file-skipped" : ""}`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={included}
-                      onChange={() => toggleFile(f.path)}
-                      disabled={uploading}
-                    />
-                    <span className="file-name" title={f.path}>
-                      {f.relative}
-                    </span>
-                    <div className="row-tags">
-                      {upToDate && (
-                        <span
-                          className="tag tag-uploaded"
-                          title={`Uploaded ${new Date(hist.uploaded_at * 1000).toLocaleString()}`}
-                        >
-                          Uploaded
-                        </span>
-                      )}
-                      {modified && (
-                        <span
-                          className="tag tag-modified"
-                          title="File changed since last upload"
-                        >
-                          Modified
-                        </span>
-                      )}
-                      {skipped && (
-                        <span
-                          className="tag tag-skipped"
-                          title={`Skipped ${new Date(skipList[f.path] * 1000).toLocaleString()}`}
-                        >
-                          Skipped
-                        </span>
-                      )}
-                    </div>
-                    {f.kind === "video" ? (
-                      <input
-                        type="checkbox"
-                        className="switch"
-                        role="switch"
-                        checked={transcodeSet.has(f.path)}
-                        onChange={() =>
-                          setTranscodeSet((prev) => {
-                            const next = new Set(prev)
-                            if (next.has(f.path)) next.delete(f.path)
-                            else next.add(f.path)
-                            return next
-                          })
-                        }
-                        disabled={uploading}
-                        title="Prepare for browser playback (H.264 MP4 + WebVTT subtitles)"
-                      />
-                    ) : (
-                      <span />
-                    )}
-                    <input
-                      type="checkbox"
-                      className="switch"
-                      role="switch"
-                      checked={skipped}
-                      onChange={() => (skipped ? unskipFile(f.path) : skipFile(f.path))}
-                      disabled={uploading}
-                      title={skipped ? "Un-skip this file" : "Don't upload this file; remember the choice"}
-                    />
-                    <div className="row-state">
-                      {st?.warning && (
-                        <span className="tag tag-warn" title={st.warning}>
-                          May not play in browser
-                        </span>
-                      )}
-                      {uploading && st ? (
-                        <span className={`status status-${st.state}`}>
-                          {st.state === "preparing" &&
-                            `${st.action ?? "preparing"}${st.preparePct ? ` ${st.preparePct}%` : ""}`}
-                          {st.state === "active" &&
-                            `${Math.floor(
-                              (Math.min(st.uploaded, f.size) / Math.max(f.size, 1)) * 100,
-                            )}%`}
-                          {st.state === "pending" && "Waiting"}
-                          {st.state === "done" && "Done"}
-                          {st.state === "error" && (st.error ?? "Error")}
-                        </span>
-                      ) : null}
-                    </div>
-                    <span className="file-size">{formatBytes(f.size)}</span>
-                    <button
-                      className="btn btn-ghost btn-del"
-                      disabled={uploading && !excluded.has(f.path)}
-                      title={uploading && !excluded.has(f.path) ? "File is queued for upload" : "Delete file from disk"}
-                      onClick={async () => {
-                        const ok = window.confirm(`Delete ${f.relative}?\nThis cannot be undone.`)
-                        if (!ok) return
-                        await invoke("delete_file", { path: f.path })
-                        setFiles((prev) => prev.filter((x) => x.path !== f.path))
-                        setExcluded((prev) => {
-                          const next = new Set(prev)
-                          next.delete(f.path)
-                          return next
-                        })
-                        setStatuses((prev) => {
-                          const next = { ...prev }
-                          delete next[f.path]
-                          return next
-                        })
-                        setTranscodeSet((prev) => {
-                          if (!prev.has(f.path)) return prev
-                          const next = new Set(prev)
-                          next.delete(f.path)
-                          return next
-                        })
-                      }}
-                    >
-                      🗑
-                    </button>
-                  </li>
-                )
-              })}
-            </ul>
+            <div className="file-list">
+              <table className="file-table">
+                <colgroup>
+                  <col className="col-check" />
+                  <col className="col-name" />
+                  <col className="col-transcript" />
+                  <col className="col-skip" />
+                  <col className="col-status" />
+                  <col className="col-size" />
+                  <col className="col-remove" />
+                </colgroup>
+                <thead>
+                  <tr className="file-header">
+                    <th />
+                    <th className="th-name">Name</th>
+                    <th className="th-transcript">Transcript</th>
+                    <th className="th-skip">Skip</th>
+                    <th className="th-status">Status</th>
+                    <th className="th-size">Size</th>
+                    <th className="th-remove">Remove</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visible.map((f) => {
+                    const st = statuses[f.path]
+                    const included = !excluded.has(f.path)
+                    const hist = history[f.path]
+                    const upToDate =
+                      hist !== undefined && hist.size === f.size && hist.mtime === f.mtime
+                    const skipped = skipList[f.path] !== undefined
+                    return (
+                      <tr
+                        key={f.path}
+                        className={`file-row ${st?.state === "error" ? "file-error" : ""} ${skipped ? "file-skipped" : ""}`}
+                      >
+                        <td className="td-check">
+                          <input
+                            type="checkbox"
+                            checked={included}
+                            onChange={() => toggleFile(f.path)}
+                            disabled={uploading}
+                          />
+                        </td>
+                        <td className="td-name">
+                          <span className="file-name" title={f.path}>
+                            {f.relative}
+                          </span>
+                          {upToDate && (
+                            <span className="badge-uploaded" title={`Uploaded ${new Date(hist.uploaded_at * 1000).toLocaleString()}`} />
+                          )}
+                        </td>
+                        <td className="td-transcript">
+                          {f.kind === "video" ? (
+                            <input
+                              type="checkbox"
+                              className="switch"
+                              role="switch"
+                              checked={transcodeSet.has(f.path)}
+                              onChange={() =>
+                                setTranscodeSet((prev) => {
+                                  const next = new Set(prev)
+                                  if (next.has(f.path)) next.delete(f.path)
+                                  else next.add(f.path)
+                                  return next
+                                })
+                              }
+                              disabled={uploading}
+                              title="Prepare for browser playback (H.264 MP4 + WebVTT subtitles)"
+                            />
+                          ) : null}
+                        </td>
+                        <td className="td-skip">
+                          <input
+                            type="checkbox"
+                            className="switch"
+                            role="switch"
+                            checked={skipped}
+                            onChange={() => (skipped ? unskipFile(f.path) : skipFile(f.path))}
+                            disabled={uploading}
+                            title={skipped ? "Un-skip this file" : "Don't upload this file; remember the choice"}
+                          />
+                        </td>
+                        <td className="td-status">
+                          <div className="row-state">
+                            {st?.warning && (
+                              <span className="tag tag-warn" title={st.warning}>
+                                May not play in browser
+                              </span>
+                            )}
+                            {uploading && st ? (
+                              <span className={`status status-${st.state}`}>
+                                {st.state === "preparing" &&
+                                  `${st.action ?? "preparing"}${st.preparePct ? ` ${st.preparePct}%` : ""}`}
+                                {st.state === "active" &&
+                                  `${Math.floor(
+                                    (Math.min(st.uploaded, f.size) / Math.max(f.size, 1)) * 100,
+                                  )}%`}
+                                {st.state === "pending" && "Waiting"}
+                                {st.state === "done" && "Done"}
+                                {st.state === "error" && (st.error ?? "Error")}
+                              </span>
+                            ) : !st?.warning ? (
+                              <span className="status status-ready">Ready</span>
+                            ) : null}
+                          </div>
+                        </td>
+                        <td className="td-size">
+                          <span className="file-size">{formatBytes(f.size)}</span>
+                        </td>
+                        <td className="td-remove">
+                          <button
+                            className="btn btn-ghost btn-del"
+                            disabled={uploading && !excluded.has(f.path)}
+                            title={uploading && !excluded.has(f.path) ? "File is queued for upload" : "Delete file from disk"}
+                            onClick={async () => {
+                              const ok = window.confirm(`Delete ${f.relative}?\nThis cannot be undone.`)
+                              if (!ok) return
+                              await invoke("delete_file", { path: f.path })
+                              setFiles((prev) => prev.filter((x) => x.path !== f.path))
+                              setExcluded((prev) => {
+                                const next = new Set(prev)
+                                next.delete(f.path)
+                                return next
+                              })
+                              setStatuses((prev) => {
+                                const next = { ...prev }
+                                delete next[f.path]
+                                return next
+                              })
+                              setTranscodeSet((prev) => {
+                                if (!prev.has(f.path)) return prev
+                                const next = new Set(prev)
+                                next.delete(f.path)
+                                return next
+                              })
+                            }}
+                          >
+                            🗑
+                          </button>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
           </>
         )}
         {scanError && <p className="hint">{scanError}</p>}
@@ -772,13 +789,25 @@ function App() {
                 {cancelling ? "Cancelling..." : "Cancel"}
               </button>
             ) : (
-              <button
-                className="btn primary"
-                onClick={startUpload}
-                disabled={!configValid || selected.length === 0}
-              >
-                Upload to R2
-              </button>
+              <>
+                <button
+                  className="btn primary"
+                  onClick={startUpload}
+                  disabled={!configValid || selected.length === 0}
+                >
+                  Upload to R2
+                </button>
+                <label className="delete-toggle" title="Remove files locally after they finish uploading">
+                  Delete after upload
+                  <input
+                    type="checkbox"
+                    className="switch"
+                    role="switch"
+                    checked={deleteAfterUpload}
+                    onChange={(e) => setDeleteAfterUpload(e.target.checked)}
+                  />
+                </label>
+              </>
             )}
             <span className="pct">{overallPct}%</span>
           </div>

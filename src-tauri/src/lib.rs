@@ -638,7 +638,9 @@ async fn upload_files(
     config: R2Config,
     items: Vec<UploadItem>,
     root: String,
+    delete_after_upload: Option<bool>,
 ) -> Result<UploadDoneEvent, String> {
+    let delete_after_upload = delete_after_upload.unwrap_or(false);
     if items.is_empty() {
         return Err("No files selected".into());
     }
@@ -886,6 +888,11 @@ async fn upload_files(
                     },
                 );
                 uploaded_count += 1;
+                if delete_after_upload {
+                    if let Err(e) = std::fs::remove_file(&item.path) {
+                        eprintln!("failed to delete {}: {e}", item.path);
+                    }
+                }
             }
             Err(e) if e == CANCELLED => {
                 let _ = app.emit(
