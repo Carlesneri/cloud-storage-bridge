@@ -143,7 +143,6 @@ function App() {
   const [transcodeSet, setTranscodeSet] = useState<Set<string>>(new Set())
   const [deleteAfterUpload, setDeleteAfterUpload] = useState(loadDeletePref)
   const [statuses, setStatuses] = useState<Record<string, FileStatus>>({})
-  const [history, setHistory] = useState<History>({})
   const [skipList, setSkipList] = useState<SkipList>({})
   const [activeKey, setActiveKey] = useState<string | null>(null)
   const [result, setResult] = useState<UploadDoneEvent | null>(null)
@@ -158,9 +157,6 @@ function App() {
       .finally(() => {
         configLoaded.current = true
       })
-    invoke<History>("get_history")
-      .then((h) => setHistory(h ?? {}))
-      .catch(() => { })
     invoke<SkipList>("get_skip_list")
       .then((s) => setSkipList(s ?? {}))
       .catch(() => { })
@@ -189,6 +185,41 @@ function App() {
     }, 700)
     return () => clearTimeout(timer)
   }, [config.secret_access_key])
+
+  // Watch the selected folder for changes and merge new files into the list.
+  useEffect(() => {
+    if (!folder) return
+
+    invoke("start_watching", { path: folder }).catch(() => {})
+
+    const unlisten = listen<string>("folder-changed", async () => {
+      if (uploading) return
+      try {
+        const media = await invoke<MediaFile[]>("scan_folder", { path: folder })
+        let hasChanges = false
+        setFiles((prev) => {
+          const onDisk = new Set(media.map((f) => f.path))
+          const kept = prev.filter((f) => onDisk.has(f.path))
+          const existingPaths = new Set(kept.map((f) => f.path))
+          const added = media.filter((f) => !existingPaths.has(f.path))
+          const next = [...kept, ...added].sort((a, b) => a.relative.localeCompare(b.relative))
+          if (next.length === 0) setScanError("No media files found in this folder.")
+          else if (prev.length === 0) setScanError(null)
+          if (next.length === prev.length && next.every((f, i) => f.path === prev[i].path)) return prev
+          hasChanges = true
+          return next
+        })
+        if (hasChanges) setResult(null)
+      } catch {
+        // ignore scan errors from watcher
+      }
+    })
+
+    return () => {
+      unlisten.then((fn) => fn())
+      invoke("stop_watching").catch(() => {})
+    }
+  }, [folder, uploading])
 
   const counts = useMemo(() => {
     const c = { all: 0, image: 0, video: 0, audio: 0 } as Record<"all" | MediaKind, number>
@@ -245,7 +276,6 @@ function App() {
         invoke<History>("get_history").catch<History>(() => ({})),
         invoke<SkipList>("get_skip_list").catch<SkipList>(() => ({})),
       ])
-      setHistory(hist ?? {})
       setSkipList(skip ?? {})
       const initialExcluded = new Set<string>()
       for (const f of media) {
@@ -358,7 +388,6 @@ function App() {
     setCancelling(false)
     setUploading(true)
 
-    const metaByPath = new Map(selected.map((f) => [f.path, f]))
     const keyByPath = new Map<string, string>()
 
     const unlistens: UnlistenFn[] = await Promise.all([
@@ -407,7 +436,6 @@ function App() {
         })
       }),
       listen<FileDoneEvent>("upload://file-done", (e) => {
-        const meta = metaByPath.get(e.payload.path)
         setStatuses((prev) => {
           const cur = prev[e.payload.path]
           if (!cur) return prev
@@ -427,15 +455,6 @@ function App() {
           next.delete(e.payload.path)
           return next
         })
-        setHistory((prev) => ({
-          ...prev,
-          [e.payload.path]: {
-            size: meta?.size ?? 0,
-            mtime: meta?.mtime ?? 0,
-            key: keyByPath.get(e.payload.path) ?? "",
-            uploaded_at: Math.floor(Date.now() / 1000),
-          },
-        }))
       }),
       listen<FileErrorEvent>("upload://file-error", (e) => {
         setStatuses((prev) => {
@@ -611,10 +630,10 @@ function App() {
                 ))}
               </div>
               <div className="toolbar-actions">
-                <button className="btn ghost" onClick={() => toggleVisible(true)} disabled={uploading}>
+                <button className="btn ghost" onClick={() => toggleVisible(true)} disabled={uploading || !!result}>
                   Select all
                 </button>
-                <button className="btn ghost" onClick={() => toggleVisible(false)} disabled={uploading}>
+                <button className="btn ghost" onClick={() => toggleVisible(false)} disabled={uploading || !!result}>
                   Deselect all
                 </button>
               </div>
@@ -646,9 +665,6 @@ function App() {
                   {visible.map((f) => {
                     const st = statuses[f.path]
                     const included = !excluded.has(f.path)
-                    const hist = history[f.path]
-                    const upToDate =
-                      hist !== undefined && hist.size === f.size && hist.mtime === f.mtime
                     const skipped = skipList[f.path] !== undefined
                     return (
                       <tr
@@ -660,16 +676,13 @@ function App() {
                             type="checkbox"
                             checked={included}
                             onChange={() => toggleFile(f.path)}
-                            disabled={uploading}
+                            disabled={uploading || !!result}
                           />
                         </td>
                         <td className="td-name">
                           <span className="file-name" title={f.path}>
                             {f.relative}
                           </span>
-                          {upToDate && (
-                            <span className="badge-uploaded" title={`Uploaded ${new Date(hist.uploaded_at * 1000).toLocaleString()}`} />
-                          )}
                         </td>
                         <td className="td-transcript">
                           {f.kind === "video" ? (
@@ -686,7 +699,7 @@ function App() {
                                   return next
                                 })
                               }
-                              disabled={uploading}
+                              disabled={uploading || !!result}
                               title="Prepare for browser playback (H.264 MP4 + WebVTT subtitles)"
                             />
                           ) : null}
@@ -698,7 +711,7 @@ function App() {
                             role="switch"
                             checked={skipped}
                             onChange={() => (skipped ? unskipFile(f.path) : skipFile(f.path))}
-                            disabled={uploading}
+                            disabled={uploading || !!result}
                             title={skipped ? "Un-skip this file" : "Don't upload this file; remember the choice"}
                           />
                         </td>
@@ -721,6 +734,10 @@ function App() {
                                 {st.state === "done" && "Done"}
                                 {st.state === "error" && (st.error ?? "Error")}
                               </span>
+                            ) : st?.state === "done" ? (
+                              <span className="status status-done">Uploaded</span>
+                            ) : st?.state === "error" ? (
+                              <span className="status status-error">{st.error ?? "Error"}</span>
                             ) : !st?.warning ? (
                               <span className="status status-ready">Ready</span>
                             ) : null}
@@ -738,7 +755,11 @@ function App() {
                               const ok = window.confirm(`Delete ${f.relative}?\nThis cannot be undone.`)
                               if (!ok) return
                               await invoke("delete_file", { path: f.path })
-                              setFiles((prev) => prev.filter((x) => x.path !== f.path))
+                              setFiles((prev) => {
+                                const next = prev.filter((x) => x.path !== f.path)
+                                if (next.length === 0) setScanError("No media files found in this folder.")
+                                return next
+                              })
                               setExcluded((prev) => {
                                 const next = new Set(prev)
                                 next.delete(f.path)
@@ -785,9 +806,21 @@ function App() {
           </div>
           <div className="upload-actions">
             {uploading ? (
-              <button className="btn danger" onClick={cancelUpload} disabled={cancelling}>
-                {cancelling ? "Cancelling..." : "Cancel"}
-              </button>
+              <>
+                <button className="btn danger" onClick={cancelUpload} disabled={cancelling}>
+                  {cancelling ? "Cancelling..." : "Cancel"}
+                </button>
+                <label className="delete-toggle" title="Remove files locally after they finish uploading">
+                  Delete after upload
+                  <input
+                    type="checkbox"
+                    className="switch"
+                    role="switch"
+                    checked={deleteAfterUpload}
+                    disabled
+                  />
+                </label>
+              </>
             ) : (
               <>
                 <button

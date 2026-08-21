@@ -11,6 +11,7 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart},
     Client,
 };
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -125,6 +126,11 @@ struct UploadState {
     cancel_tx: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
+struct WatchState {
+    watcher: Mutex<Option<RecommendedWatcher>>,
+    watched_path: Mutex<Option<String>>,
+}
+
 fn kind_for_ext(ext: &str) -> Option<MediaKind> {
     if IMAGE_EXTS.contains(&ext) {
         Some(MediaKind::Image)
@@ -212,6 +218,55 @@ fn scan_folder(path: String) -> Result<Vec<MediaFile>, String> {
 
     files.sort_by(|a, b| a.relative.cmp(&b.relative));
     Ok(files)
+}
+
+#[tauri::command]
+fn start_watching(path: String, state: State<'_, WatchState>, app: AppHandle) -> Result<(), String> {
+    let mut watched = state.watched_path.lock().map_err(|e| e.to_string())?;
+    if watched.as_deref() == Some(&path) {
+        return Ok(());
+    }
+
+    // Drop any existing watcher
+    {
+        let mut watcher_lock = state.watcher.lock().map_err(|e| e.to_string())?;
+        *watcher_lock = None;
+    }
+    *watched = None;
+
+    let app_handle = app.clone();
+    let path_clone = path.clone();
+    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+        if let Ok(event) = res {
+            match event.kind {
+                EventKind::Create(_)
+                | EventKind::Remove(_)
+                | EventKind::Modify(_) => {
+                    let _ = app_handle.emit("folder-changed", &path_clone);
+                }
+                _ => {}
+            }
+        }
+    })
+    .map_err(|e| e.to_string())?;
+
+    watcher
+        .watch(Path::new(&path), RecursiveMode::Recursive)
+        .map_err(|e| e.to_string())?;
+
+    let mut watcher_lock = state.watcher.lock().map_err(|e| e.to_string())?;
+    *watcher_lock = Some(watcher);
+    *watched = Some(path);
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_watching(state: State<'_, WatchState>) -> Result<(), String> {
+    let mut watcher_lock = state.watcher.lock().map_err(|e| e.to_string())?;
+    *watcher_lock = None;
+    let mut watched = state.watched_path.lock().map_err(|e| e.to_string())?;
+    *watched = None;
+    Ok(())
 }
 
 fn emit_progress(app: &AppHandle, index: usize, path: &str, uploaded: u64) {
@@ -1300,6 +1355,10 @@ pub fn run() {
         .manage(UploadState {
             cancel_tx: Mutex::new(None),
         })
+        .manage(WatchState {
+            watcher: Mutex::new(None),
+            watched_path: Mutex::new(None),
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 // If an upload is in progress, cancel it first and defer
@@ -1333,6 +1392,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             select_folder,
             scan_folder,
+            start_watching,
+            stop_watching,
             upload_files,
             cancel_upload,
             save_config,

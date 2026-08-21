@@ -513,17 +513,6 @@ th {
   vertical-align: middle;
 }
 
-.badge-uploaded {
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--ok);
-  margin-left: 6px;
-  vertical-align: middle;
-  flex-shrink: 0;
-}
-
 .file-name {
   display: block;
   overflow: hidden;
