@@ -38,6 +38,8 @@ const PART_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_PARTS: u64 = 10_000;
 const MAX_ATTEMPTS: u32 = 3;
 const CANCELLED: &str = "cancelled";
+/// Aborts only the file currently being uploaded; the batch continues.
+const SKIPPED: &str = "removed during upload";
 
 #[derive(Clone, Copy, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -124,6 +126,8 @@ struct UploadDoneEvent {
 
 struct UploadState {
     cancel_tx: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    /// Bumped to abort the in-flight file's I/O without ending the batch.
+    skip_tx: Mutex<Option<tokio::sync::watch::Sender<u64>>>,
 }
 
 struct WatchState {
@@ -339,6 +343,43 @@ where
     }
 }
 
+/// Resolves when the skip counter moves past `gen`.
+async fn wait_skipped(rx: &tokio::sync::watch::Receiver<u64>, gen: u64) {
+    if *rx.borrow() != gen {
+        return;
+    }
+    let mut rx = rx.clone();
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() != gen {
+            return;
+        }
+    }
+}
+
+/// Run a disk-I/O future, aborting on batch cancel, per-file skip, or timeout.
+/// Disk reads can block indefinitely when the file or its device vanishes
+/// mid-read, so all three escape hatches are needed.
+async fn disk_io<T, F>(
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+    skip_rx: &tokio::sync::watch::Receiver<u64>,
+    gen: u64,
+    fut: F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    tokio::select! {
+        _ = wait_cancelled(cancel_rx) => Err(CANCELLED.to_string()),
+        _ = wait_skipped(skip_rx, gen) => Err(SKIPPED.to_string()),
+        res = tokio::time::timeout(Duration::from_secs(10), fut) => {
+            match res {
+                Ok(r) => r,
+                Err(_) => Err("disk I/O timeout (device may have been removed)".to_string()),
+            }
+        }
+    }
+}
+
 /// HTTP/1.1-only S3 HTTP client (Cloudflare R2 can reset HTTP/2 connections
 /// mid-session, which the AWS SDK surfaces as opaque "dispatch failure"
 /// errors). Restricting ALPN to http/1.1 avoids that class of failures.
@@ -451,15 +492,20 @@ async fn upload_one(
     index: usize,
     key: &str,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    skip_rx: &tokio::sync::watch::Receiver<u64>,
 ) -> Result<(), String> {
     if *cancel_rx.borrow_and_update() {
         return Err(CANCELLED.to_string());
+    }
+    if !disk_path.exists() {
+        return Err(SKIPPED.to_string());
     }
 
     let content_type = content_type_for(disk_path);
 
     if size <= SMALL_FILE_LIMIT {
-        let data = cancelable(&mut cancel_rx, async {
+        let gen = *skip_rx.borrow();
+        let data = disk_io(&mut cancel_rx, skip_rx, gen, async {
             tokio::fs::read(disk_path)
                 .await
                 .map_err(|e| format!("read error: {e}"))
@@ -489,7 +535,8 @@ async fn upload_one(
     }
 
     // Multipart upload for large files, with per-part progress and retry.
-    let file = cancelable(&mut cancel_rx, async {
+    let gen = *skip_rx.borrow();
+    let file = disk_io(&mut cancel_rx, skip_rx, gen, async {
         tokio::fs::File::open(disk_path)
             .await
             .map_err(|e| format!("open error: {e}"))
@@ -534,6 +581,7 @@ async fn upload_one(
         index,
         part_size,
         &mut cancel_rx,
+        skip_rx,
     )
     .await;
 
@@ -600,6 +648,7 @@ async fn upload_parts(
     index: usize,
     part_size: u64,
     cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+    skip_rx: &tokio::sync::watch::Receiver<u64>,
 ) -> Result<Vec<CompletedPart>, String> {
     let mut parts = Vec::new();
     let mut uploaded: u64 = 0;
@@ -612,7 +661,8 @@ async fn upload_parts(
 
         let this_len = part_size.min(size - uploaded) as usize;
         let mut buf = vec![0u8; this_len];
-        cancelable(cancel_rx, async {
+        let gen = *skip_rx.borrow();
+        disk_io(cancel_rx, skip_rx, gen, async {
             reader
                 .read_exact(&mut buf)
                 .await
@@ -758,6 +808,8 @@ async fn upload_files(
 
     let (tx, mut rx) = tokio::sync::watch::channel(false);
     *state.cancel_tx.lock().unwrap() = Some(tx);
+    let (skip_tx, skip_rx) = tokio::sync::watch::channel(0u64);
+    *state.skip_tx.lock().unwrap() = Some(skip_tx);
 
     let prefix = config.prefix.trim().trim_matches('/');
     let mut uploaded_count = 0usize;
@@ -774,6 +826,21 @@ async fn upload_files(
         if *rx.borrow_and_update() {
             cancelled = true;
             break;
+        }
+
+        // Queued file vanished while waiting its turn (deleted locally or
+        // the device dropped it) — fail it quietly and move on.
+        if !Path::new(&item.path).exists() {
+            let _ = app.emit(
+                "upload://file-error",
+                FileErrorEvent {
+                    index,
+                    path: item.path.clone(),
+                    error: SKIPPED.to_string(),
+                },
+            );
+            failed_count += 1;
+            continue;
         }
 
         // Only upload files that live inside the folder the user picked.
@@ -897,6 +964,7 @@ async fn upload_files(
             index,
             &key,
             rx.clone(),
+            &skip_rx,
         )
         .await;
 
@@ -974,6 +1042,17 @@ async fn upload_files(
                 cancelled = true;
                 break;
             }
+            Err(e) if e == SKIPPED => {
+                let _ = app.emit(
+                    "upload://file-error",
+                    FileErrorEvent {
+                        index,
+                        path: item.path.clone(),
+                        error: e,
+                    },
+                );
+                failed_count += 1;
+            }
             Err(e) => {
                 let _ = app.emit(
                     "upload://file-error",
@@ -989,6 +1068,7 @@ async fn upload_files(
     }
 
     *state.cancel_tx.lock().unwrap() = None;
+    *state.skip_tx.lock().unwrap() = None;
 
     let done = UploadDoneEvent {
         uploaded: uploaded_count,
@@ -1003,6 +1083,16 @@ async fn upload_files(
 fn cancel_upload(state: State<'_, UploadState>) {
     if let Some(tx) = state.cancel_tx.lock().unwrap().as_ref() {
         let _ = tx.send(true);
+    }
+}
+
+/// Abort the file currently being uploaded (e.g. it vanished from disk) and
+/// let the batch continue with the remaining items.
+#[tauri::command]
+fn skip_current_file(state: State<'_, UploadState>) {
+    if let Some(tx) = state.skip_tx.lock().unwrap().as_ref() {
+        let next = tx.borrow().wrapping_add(1);
+        let _ = tx.send(next);
     }
 }
 
@@ -1367,6 +1457,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(UploadState {
             cancel_tx: Mutex::new(None),
+            skip_tx: Mutex::new(None),
         })
         .manage(WatchState {
             watcher: Mutex::new(None),
@@ -1409,6 +1500,7 @@ pub fn run() {
             stop_watching,
             upload_files,
             cancel_upload,
+            skip_current_file,
             save_config,
             load_config,
             save_secret,

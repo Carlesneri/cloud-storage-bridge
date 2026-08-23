@@ -41,7 +41,9 @@ interface UploadItem {
   relative: string
   size: number
   transcode: boolean
-}interface FileStartEvent {
+}
+
+interface FileStartEvent {
   index: number
   path: string
   key: string
@@ -110,15 +112,70 @@ const KIND_LABEL: Record<MediaKind, string> = {
   audio: "Audio",
 }
 
-function loadSavedConfig(): R2Config {
-  return { ...DEFAULT_CONFIG }
-}
-
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B"
   const units = ["B", "KB", "MB", "GB", "TB"]
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
   return `${(bytes / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`
+}
+
+/** Immutable Set update: copy `prev`, apply `mutate`, return the copy. */
+function updateSet(prev: Set<string>, mutate: (next: Set<string>) => void): Set<string> {
+  const next = new Set(prev)
+  mutate(next)
+  return next
+}
+
+/** Status pill for a file row; null means "render nothing (warning tag only)". */
+function statusView(
+  st: FileStatus | undefined,
+  size: number,
+  live: boolean,
+): { cls: string; text: string } | null {
+  if (st && (live || st.state === "done" || st.state === "error")) {
+    switch (st.state) {
+      case "done":
+        return { cls: "status-done", text: "Uploaded" }
+      case "error":
+        return { cls: "status-error", text: st.error ?? "Error" }
+      case "pending":
+        return { cls: "status-pending", text: "Waiting" }
+      case "preparing":
+        return {
+          cls: "status-preparing",
+          text: `${st.action ?? "preparing"}${st.preparePct ? ` ${st.preparePct}%` : ""}`,
+        }
+      case "active": {
+        const pct = Math.floor((Math.min(st.uploaded, size) / Math.max(size, 1)) * 100)
+        return { cls: "status-active", text: `${pct}%` }
+      }
+    }
+  }
+  if (!st?.warning) return { cls: "status-ready", text: "Ready" }
+  return null
+}
+
+/** Labeled switch used in the upload footer. */
+function Toggle(props: {
+  label: string
+  title: string
+  checked: boolean
+  disabled?: boolean
+  onChange?: (value: boolean) => void
+}) {
+  return (
+    <label className="delete-toggle" title={props.title}>
+      {props.label}
+      <input
+        type="checkbox"
+        className="switch"
+        role="switch"
+        checked={props.checked}
+        disabled={props.disabled}
+        onChange={(e) => props.onChange?.(e.target.checked)}
+      />
+    </label>
+  )
 }
 
 const DELETE_KEY = "delete-after-upload"
@@ -128,7 +185,7 @@ function loadDeletePref(): boolean {
 }
 
 function App() {
-  const [config, setConfig] = useState<R2Config>(loadSavedConfig)
+  const [config, setConfig] = useState<R2Config>(() => ({ ...DEFAULT_CONFIG }))
   const configLoaded = useRef(false)
   const [folder, setFolder] = useState<string | null>(null)
   const [files, setFiles] = useState<MediaFile[]>([])
@@ -148,12 +205,12 @@ function App() {
   const autoUploadRef = useRef(false)
   const secretRef = useRef<string | null>(null)
   const pendingAutoRef = useRef<MediaFile[]>([])
-  const excludedRef = useRef<Set<string>>(new Set())
   const uploadingRef = useRef(false)
   const filesRef = useRef<MediaFile[]>([])
   const [statuses, setStatuses] = useState<Record<string, FileStatus>>({})
   const [skipList, setSkipList] = useState<SkipList>({})
   const [activeKey, setActiveKey] = useState<string | null>(null)
+  const [activePath, setActivePath] = useState<string | null>(null)
   const [result, setResult] = useState<UploadDoneEvent | null>(null)
   const [commandError, setCommandError] = useState<string | null>(null)
 
@@ -176,25 +233,82 @@ function App() {
     localStorage.setItem(DELETE_KEY, deleteAfterUpload ? "1" : "0")
   }, [deleteAfterUpload])
 
-  // Keep refs in sync for the folder-changed listener (avoids stale closures).
-  useEffect(() => { autoUploadRef.current = autoUpload }, [autoUpload])
-  useEffect(() => { autoActiveRef.current = autoActive }, [autoActive])
-  useEffect(() => { excludedRef.current = excluded }, [excluded])
-  useEffect(() => { uploadingRef.current = uploading }, [uploading])
-  useEffect(() => { filesRef.current = files }, [files])
-
-  // Chain auto-uploads: after each batch finishes, upload any remaining
-  // unexcluded files (queued by the watcher or picked up by the re-scan).
+  // Upload progress events: subscribed once; every handler only does
+  // functional state updates, so no per-batch teardown is needed.
   useEffect(() => {
-    if (uploading || !autoActive) return
-    const pending = pendingAutoRef.current.splice(0)
-    const toUpload = pending.length > 0
-      ? pending
-      : files.filter((f) => !excluded.has(f.path))
-    if (toUpload.length > 0) {
-      startUpload(toUpload)
+    const subs: Promise<UnlistenFn>[] = [
+      listen<PrepareStartEvent>("upload://prepare-start", (e) => {
+        setStatuses((prev) => {
+          const cur = prev[e.payload.path]
+          if (!cur) return prev
+          return {
+            ...prev,
+            [e.payload.path]: { ...cur, state: "preparing", action: e.payload.action, preparePct: 0 },
+          }
+        })
+      }),
+      listen<PrepareProgressEvent>("upload://prepare-progress", (e) => {
+        setStatuses((prev) => {
+          const cur = prev[e.payload.path]
+          if (!cur || cur.state !== "preparing") return prev
+          const pct =
+            e.payload.duration > 0
+              ? Math.min(100, Math.round((e.payload.seconds / e.payload.duration) * 100))
+              : 0
+          return { ...prev, [e.payload.path]: { ...cur, preparePct: pct } }
+        })
+      }),
+      listen<FileStartEvent>("upload://file-start", (e) => {
+        setStatuses((prev) => ({
+          ...prev,
+          [e.payload.path]: { state: "active", uploaded: 0 },
+        }))
+        setActiveKey(e.payload.key)
+        setActivePath(e.payload.path)
+      }),
+      listen<FileProgressEvent>("upload://progress", (e) => {
+        setStatuses((prev) => {
+          const cur = prev[e.payload.path]
+          if (!cur) return prev
+          return { ...prev, [e.payload.path]: { ...cur, uploaded: e.payload.uploaded } }
+        })
+      }),
+      listen<FileDoneEvent>("upload://file-done", (e) => {
+        setStatuses((prev) => {
+          const cur = prev[e.payload.path]
+          if (!cur) return prev
+          return {
+            ...prev,
+            [e.payload.path]: { state: "done", uploaded: cur.uploaded, warning: e.payload.warning },
+          }
+        })
+        // Once uploaded, the file no longer needs preparation next time.
+        setTranscodeSet((prev) => updateSet(prev, (next) => next.delete(e.payload.path)))
+      }),
+      listen<FileErrorEvent>("upload://file-error", (e) => {
+        setStatuses((prev) => ({
+          ...prev,
+          [e.payload.path]: {
+            state: "error",
+            uploaded: prev[e.payload.path]?.uploaded ?? 0,
+            error: e.payload.error === "cancelled" ? "Cancelled" : e.payload.error,
+          },
+        }))
+      }),
+    ]
+    return () => {
+      Promise.all(subs).then((fns) => fns.forEach((fn) => fn()))
     }
-  }, [uploading, autoActive])
+  }, [])
+
+  // Keep refs in sync for async callbacks (watcher, pump) that must read
+  // fresh values without re-subscribing. One effect covers them all.
+  useEffect(() => {
+    autoUploadRef.current = autoUpload
+    autoActiveRef.current = autoActive
+    uploadingRef.current = uploading
+    filesRef.current = files
+  })
 
   // Persist the non-secret settings whenever they change.
   useEffect(() => {
@@ -240,18 +354,20 @@ function App() {
           setFiles(next)
           setResult(null)
         }
+        // Files vanished while uploading: the backend may be wedged on I/O
+        // for one of them. Skip just that file; the batch continues.
+        if (kept.length < prevFiles.length && uploadingRef.current) {
+          invoke("skip_current_file").catch(() => {})
+        }
         if (autoUploadRef.current && autoActiveRef.current && added.length > 0) {
-          // New arrivals are always fresh — clear any stale exclusion.
+          // New arrivals are always fresh — clear any stale exclusion, then
+          // queue them; the pump effect uploads them when idle.
           setExcluded((prev) => {
             const n = new Set(prev)
             for (const f of added) n.delete(f.path)
             return n
           })
-          if (uploadingRef.current) {
-            pendingAutoRef.current.push(...added)
-          } else {
-            startUpload(added)
-          }
+          pendingAutoRef.current.push(...added)
         }
       } catch {
         // ignore scan errors from watcher
@@ -303,6 +419,19 @@ function App() {
 
   const hasCredentials = Object.values(config).some((v) => v.trim().length > 0)
 
+  // Armed auto-upload pump: whenever idle and armed, drain the watcher's
+  // queue; if empty, upload whatever is currently selected (covers files the
+  // user checked after arming, and leftovers found by the post-batch scan).
+  useEffect(() => {
+    if (!autoActive || uploading) return
+    const batch = pendingAutoRef.current.splice(0)
+    const toUpload = batch.length > 0 ? batch : selected
+    if (toUpload.length > 0) {
+      startUpload(toUpload)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uploading, autoActive, selected])
+
   async function pickFolder() {
     setScanError(null)
     setResult(null)
@@ -323,19 +452,18 @@ function App() {
       const initialExcluded = new Set<string>()
       for (const f of media) {
         const h = hist[f.path]
-        if (h && h.size === f.size && h.mtime === f.mtime) {
-          initialExcluded.add(f.path)
-        } else if (skip[f.path] !== undefined) {
-          initialExcluded.add(f.path)
-        }
+        const alreadyUploaded = h !== undefined && h.size === f.size && h.mtime === f.mtime
+        if (alreadyUploaded || skip[f.path] !== undefined) initialExcluded.add(f.path)
       }
       setExcluded(initialExcluded)
+      filesRef.current = media
       setFiles(media)
       if (media.length === 0) {
         setScanError("No media files found in this folder.")
       }
     } catch (e) {
       setFolder(null)
+      filesRef.current = []
       setFiles([])
       setScanError(String(e))
     } finally {
@@ -346,29 +474,21 @@ function App() {
   function toggleFile(path: string) {
     const wasSkipped = skipList[path] !== undefined
     const becomingIncluded = excluded.has(path)
-    setExcluded((prev) => {
-      const next = new Set(prev)
-      if (next.has(path)) next.delete(path)
-      else next.add(path)
-      return next
-    })
+    setExcluded((prev) =>
+      updateSet(prev, (next) => (next.has(path) ? next.delete(path) : next.add(path))),
+    )
     if (wasSkipped && becomingIncluded) {
       const next = { ...skipList }
       delete next[path]
       setSkipList(next)
-      invoke("remove_skip", { path: path }).catch(() => { })
+      invoke("remove_skip", { path }).catch(() => { })
     }
   }
 
   function skipFile(path: string) {
-    setExcluded((prev) => {
-      const next = new Set(prev)
-      next.add(path)
-      return next
-    })
-    const now = Math.floor(Date.now() / 1000)
-    setSkipList((prev) => ({ ...prev, [path]: now }))
-    invoke("add_skip", { path: path }).catch(() => { })
+    setExcluded((prev) => updateSet(prev, (next) => next.add(path)))
+    setSkipList((prev) => ({ ...prev, [path]: Math.floor(Date.now() / 1000) }))
+    invoke("add_skip", { path }).catch(() => { })
   }
 
   function unskipFile(path: string) {
@@ -377,18 +497,18 @@ function App() {
       delete next[path]
       return next
     })
-    invoke("remove_skip", { path: path }).catch(() => { })
+    invoke("remove_skip", { path }).catch(() => { })
   }
 
   function toggleVisible(check: boolean) {
-    setExcluded((prev) => {
-      const next = new Set(prev)
-      for (const f of visible) {
-        if (!check) next.add(f.path)
-        else next.delete(f.path)
-      }
-      return next
-    })
+    setExcluded((prev) =>
+      updateSet(prev, (next) => {
+        for (const f of visible) {
+          if (check) next.delete(f.path)
+          else next.add(f.path)
+        }
+      }),
+    )
   }
 
   async function cancelUpload() {
@@ -403,34 +523,36 @@ function App() {
     }
   }
 
+  /** Secret from the form, else the cached one, else the OS keychain. */
+  async function resolveSecret(): Promise<string | null> {
+    const typed = config.secret_access_key.trim()
+    if (typed.length > 0) return typed
+    if (secretRef.current) return secretRef.current
+    const stored = await invoke<string | null>("load_secret").catch<null>(() => null)
+    const secret = (stored ?? "").trim()
+    if (secret.length > 0) secretRef.current = secret
+    return secret
+  }
+
   async function startUpload(autoFiles?: MediaFile[]) {
-    // Fetch the secret once, cache it so subsequent auto-uploads don't re-prompt.
-    let secret = config.secret_access_key.trim()
-    if (secret.length === 0) {
-      if (secretRef.current) {
-        secret = secretRef.current
-      } else {
-        const stored = await invoke<string | null>("load_secret").catch<null>(() => null)
-        secret = (stored ?? "").trim()
-        if (secret.length > 0) secretRef.current = secret
-      }
-    }
-    if (secret.length === 0) {
+    if (uploadingRef.current || !folder) return
+    const source = autoFiles ?? selected
+
+    const secret = await resolveSecret()
+    if (!secret) {
       setCommandError("Enter your R2 Secret Access Key to upload.")
       return
     }
-
+    // Clicking Auto Upload arms the watcher even with nothing selected yet.
     if (autoUpload) setAutoActive(true)
-    setCancelling(false)
-    const source = autoFiles ?? selected
+    if (source.length === 0) return
+
     const items: UploadItem[] = source.map((f) => ({
       path: f.path,
       relative: f.relative,
       size: f.size,
       transcode: f.kind === "video" && transcodeSet.has(f.path),
     }))
-    if (items.length === 0 || uploading) return
-
     const initial: Record<string, FileStatus> = {}
     for (const f of source) initial[f.path] = { state: "pending", uploaded: 0 }
     setStatuses(initial)
@@ -439,91 +561,7 @@ function App() {
     setActiveKey(null)
     setCancelling(false)
     setUploading(true)
-
-    const keyByPath = new Map<string, string>()
-
-    const unlistens: UnlistenFn[] = await Promise.all([
-      listen<PrepareStartEvent>("upload://prepare-start", (e) => {
-        setStatuses((prev) => {
-          const cur = prev[e.payload.path]
-          if (!cur) return prev
-          return {
-            ...prev,
-            [e.payload.path]: {
-              ...cur,
-              state: "preparing",
-              action: e.payload.action,
-              preparePct: 0,
-            },
-          }
-        })
-      }),
-      listen<PrepareProgressEvent>("upload://prepare-progress", (e) => {
-        setStatuses((prev) => {
-          const cur = prev[e.payload.path]
-          if (!cur || cur.state !== "preparing") return prev
-          const pct =
-            e.payload.duration > 0
-              ? Math.min(100, Math.round((e.payload.seconds / e.payload.duration) * 100))
-              : 0
-          return { ...prev, [e.payload.path]: { ...cur, preparePct: pct } }
-        })
-      }),
-      listen<FileStartEvent>("upload://file-start", (e) => {
-        keyByPath.set(e.payload.path, e.payload.key)
-        setStatuses((prev) => ({
-          ...prev,
-          [e.payload.path]: { state: "active", uploaded: 0 },
-        }))
-        setActiveKey(e.payload.key)
-      }),
-      listen<FileProgressEvent>("upload://progress", (e) => {
-        setStatuses((prev) => {
-          const cur = prev[e.payload.path]
-          if (!cur) return prev
-          return {
-            ...prev,
-            [e.payload.path]: { ...cur, uploaded: e.payload.uploaded },
-          }
-        })
-      }),
-      listen<FileDoneEvent>("upload://file-done", (e) => {
-        setStatuses((prev) => {
-          const cur = prev[e.payload.path]
-          if (!cur) return prev
-          return {
-            ...prev,
-            [e.payload.path]: {
-              state: "done",
-              uploaded: cur.uploaded,
-              warning: e.payload.warning,
-            },
-          }
-        })
-        // Once uploaded, the file no longer needs preparation next time.
-        setTranscodeSet((prev) => {
-          if (!prev.has(e.payload.path)) return prev
-          const next = new Set(prev)
-          next.delete(e.payload.path)
-          return next
-        })
-      }),
-      listen<FileErrorEvent>("upload://file-error", (e) => {
-        setStatuses((prev) => {
-          const cur = prev[e.payload.path]
-          const error =
-            e.payload.error === "cancelled" ? "Cancelled" : e.payload.error
-          return {
-            ...prev,
-            [e.payload.path]: {
-              state: "error",
-              uploaded: cur?.uploaded ?? 0,
-              error,
-            },
-          }
-        })
-      }),
-    ])
+    uploadingRef.current = true
 
     try {
       const done = await invoke<UploadDoneEvent>("upload_files", {
@@ -536,34 +574,35 @@ function App() {
     } catch (e) {
       setCommandError(String(e))
     } finally {
-      for (const u of unlistens) u()
       setActiveKey(null)
+      setActivePath(null)
       setCancelling(false)
-      // Re-scan the folder to sync with disk: removes deleted files
-      // and picks up files that arrived during upload.
-      if (folder) {
-        try {
-          const media = await invoke<MediaFile[]>("scan_folder", { path: folder })
-          const onDisk = new Set(media.map((f) => f.path))
-          setFiles(media)
-          setStatuses((prev) => {
-            const next: Record<string, FileStatus> = {}
-            for (const [k, v] of Object.entries(prev)) {
-              if (onDisk.has(k) && v.state !== "error") next[k] = v
-            }
-            return next
-          })
-          // Exclude processed files so they aren't re-selected.
-          setExcluded((prev) => {
-            const next = new Set(prev)
-            for (const item of items) next.add(item.path)
-            return next
-          })
-        } catch {
-          // ignore scan errors
-        }
-      }
+      await rescan(items)
+      uploadingRef.current = false
       setUploading(false)
+    }
+  }
+
+  /** Sync the file list with disk after a batch and exclude what was processed. */
+  async function rescan(processed: UploadItem[]) {
+    if (!folder) return
+    try {
+      const media = await invoke<MediaFile[]>("scan_folder", { path: folder })
+      filesRef.current = media
+      setFiles(media)
+      const onDisk = new Set(media.map((f) => f.path))
+      setStatuses((prev) => {
+        const next: Record<string, FileStatus> = {}
+        for (const [k, v] of Object.entries(prev)) {
+          if (onDisk.has(k) && v.state !== "error") next[k] = v
+        }
+        return next
+      })
+      setExcluded((prev) => updateSet(prev, (next) => {
+        for (const item of processed) next.add(item.path)
+      }))
+    } catch {
+      // ignore scan errors
     }
   }
 
@@ -576,7 +615,10 @@ function App() {
         <div className="header-title">
           <img src={logo} className="logo" alt="Cloud Storage Bridge" />
           <div>
-            <h1>Cloud Storage Bridge</h1>
+            <h1>
+              Cloud Storage Bridge
+              {import.meta.env.DEV && <span className="dev-badge">dev</span>}
+            </h1>
             <p>Upload a folder's media to a Cloudflare R2 bucket</p>
           </div>
         </div>
@@ -705,10 +747,10 @@ function App() {
                 ))}
               </div>
               <div className="toolbar-actions">
-                <button className="btn ghost" onClick={() => toggleVisible(true)} disabled={uploading}>
+                <button className="btn ghost" onClick={() => toggleVisible(true)}>
                   Select all
                 </button>
-                <button className="btn ghost" onClick={() => toggleVisible(false)} disabled={uploading}>
+                <button className="btn ghost" onClick={() => toggleVisible(false)}>
                   Deselect all
                 </button>
               </div>
@@ -741,6 +783,7 @@ function App() {
                     const st = statuses[f.path]
                     const included = !excluded.has(f.path)
                     const skipped = skipList[f.path] !== undefined
+                    const sv = statusView(st, f.size, uploading)
                     return (
                       <tr
                         key={f.path}
@@ -751,7 +794,7 @@ function App() {
                             type="checkbox"
                             checked={included}
                             onChange={() => toggleFile(f.path)}
-                            disabled={uploading}
+                            disabled={f.path === activePath}
                           />
                         </td>
                         <td className="td-name">
@@ -774,7 +817,7 @@ function App() {
                                   return next
                                 })
                               }
-                              disabled={uploading}
+                              disabled={f.path === activePath}
                               title="Prepare for browser playback (H.264 MP4 + WebVTT subtitles)"
                             />
                           ) : null}
@@ -786,7 +829,7 @@ function App() {
                             role="switch"
                             checked={skipped}
                             onChange={() => (skipped ? unskipFile(f.path) : skipFile(f.path))}
-                            disabled={uploading}
+                            disabled={f.path === activePath}
                             title={skipped ? "Un-skip this file" : "Don't upload this file; remember the choice"}
                           />
                         </td>
@@ -797,25 +840,7 @@ function App() {
                                 May not play in browser
                               </span>
                             )}
-                            {uploading && st ? (
-                              <span className={`status status-${st.state}`}>
-                                {st.state === "preparing" &&
-                                  `${st.action ?? "preparing"}${st.preparePct ? ` ${st.preparePct}%` : ""}`}
-                                {st.state === "active" &&
-                                  `${Math.floor(
-                                    (Math.min(st.uploaded, f.size) / Math.max(f.size, 1)) * 100,
-                                  )}%`}
-                                {st.state === "pending" && "Waiting"}
-                                {st.state === "done" && "Done"}
-                                {st.state === "error" && (st.error ?? "Error")}
-                              </span>
-                            ) : st?.state === "done" ? (
-                              <span className="status status-done">Uploaded</span>
-                            ) : st?.state === "error" ? (
-                              <span className="status status-error">{st.error ?? "Error"}</span>
-                            ) : !st?.warning ? (
-                              <span className="status status-ready">Ready</span>
-                            ) : null}
+                            {sv && <span className={`status ${sv.cls}`}>{sv.text}</span>}
                           </div>
                         </td>
                         <td className="td-size">
@@ -824,33 +849,24 @@ function App() {
                         <td className="td-remove">
                           <button
                             className="btn btn-ghost btn-del"
-                            disabled={uploading && !excluded.has(f.path)}
-                            title={uploading && !excluded.has(f.path) ? "File is queued for upload" : "Delete file from disk"}
+                            disabled={f.path === activePath}
+                            title="Delete file from disk"
                             onClick={async () => {
                               const ok = window.confirm(`Delete ${f.relative}?\nThis cannot be undone.`)
                               if (!ok) return
                               await invoke("delete_file", { path: f.path })
-                              setFiles((prev) => {
-                                const next = prev.filter((x) => x.path !== f.path)
-                                if (next.length === 0) setScanError("No media files found in this folder.")
-                                return next
-                              })
-                              setExcluded((prev) => {
-                                const next = new Set(prev)
-                                next.delete(f.path)
-                                return next
-                              })
+                              filesRef.current = filesRef.current.filter((x) => x.path !== f.path)
+                              setFiles(filesRef.current)
+                              if (filesRef.current.length === 0) {
+                                setScanError("No media files found in this folder.")
+                              }
+                              setExcluded((prev) => updateSet(prev, (next) => next.delete(f.path)))
                               setStatuses((prev) => {
                                 const next = { ...prev }
                                 delete next[f.path]
                                 return next
                               })
-                              setTranscodeSet((prev) => {
-                                if (!prev.has(f.path)) return prev
-                                const next = new Set(prev)
-                                next.delete(f.path)
-                                return next
-                              })
+                              setTranscodeSet((prev) => updateSet(prev, (next) => next.delete(f.path)))
                             }}
                           >
                             🗑
@@ -881,62 +897,32 @@ function App() {
           </div>
           <div className="upload-actions">
             {uploading || autoActive ? (
-              <>
-                <button className="btn danger" onClick={cancelUpload} disabled={cancelling}>
-                  {cancelling ? "Cancelling..." : "Cancel"}
-                </button>
-                <label className="delete-toggle" title="Remove files locally after they finish uploading">
-                  Delete after upload
-                  <input
-                    type="checkbox"
-                    className="switch"
-                    role="switch"
-                    checked={deleteAfterUpload}
-                    disabled
-                  />
-                </label>
-                <label className="delete-toggle" title="Automatically upload every new file added to this folder">
-                  Auto upload
-                  <input
-                    type="checkbox"
-                    className="switch"
-                    role="switch"
-                    checked={autoUpload}
-                    disabled
-                  />
-                </label>
-              </>
+              <button className="btn danger" onClick={cancelUpload} disabled={cancelling}>
+                {cancelling ? "Cancelling..." : "Cancel"}
+              </button>
             ) : (
-              <>
-                <button
-                  className="btn primary"
-                  onClick={() => startUpload()}
-                  disabled={!configValid || (!autoUpload && selected.length === 0)}
-                >
-                  {autoUpload ? "Auto Upload" : "Upload to R2"}
-                </button>
-                <label className="delete-toggle" title="Remove files locally after they finish uploading">
-                  Delete after upload
-                  <input
-                    type="checkbox"
-                    className="switch"
-                    role="switch"
-                    checked={deleteAfterUpload}
-                    onChange={(e) => setDeleteAfterUpload(e.target.checked)}
-                  />
-                </label>
-                <label className="delete-toggle" title="Automatically upload every new file added to this folder">
-                  Auto upload
-                  <input
-                    type="checkbox"
-                    className="switch"
-                    role="switch"
-                    checked={autoUpload}
-                    onChange={(e) => setAutoUpload(e.target.checked)}
-                  />
-                </label>
-              </>
+              <button
+                className="btn primary"
+                onClick={() => startUpload()}
+                disabled={!configValid || (!autoUpload && selected.length === 0)}
+              >
+                {autoUpload ? "Auto Upload" : "Upload to R2"}
+              </button>
             )}
+            <Toggle
+              label="Delete after upload"
+              title="Remove files locally after they finish uploading"
+              checked={deleteAfterUpload}
+              disabled={uploading || autoActive}
+              onChange={setDeleteAfterUpload}
+            />
+            <Toggle
+              label="Auto upload"
+              title="Automatically upload every new file added to this folder"
+              checked={autoUpload}
+              disabled={uploading || autoActive}
+              onChange={setAutoUpload}
+            />
             <span className="pct">{overallPct}%</span>
           </div>
           {result && (
