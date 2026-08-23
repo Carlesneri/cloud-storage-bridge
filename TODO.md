@@ -1,4 +1,8 @@
-- Add watcher to a folder
+- Improve error handling
+- Improve modularity
+- Improve security
+- Improve logic
+
 
 
 

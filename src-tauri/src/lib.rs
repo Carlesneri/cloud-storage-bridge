@@ -459,9 +459,12 @@ async fn upload_one(
     let content_type = content_type_for(disk_path);
 
     if size <= SMALL_FILE_LIMIT {
-        let data = tokio::fs::read(disk_path)
-            .await
-            .map_err(|e| format!("read error: {e}"))?;
+        let data = cancelable(&mut cancel_rx, async {
+            tokio::fs::read(disk_path)
+                .await
+                .map_err(|e| format!("read error: {e}"))
+        })
+        .await?;
         let len = data.len() as u64;
         cancelable(
             &mut cancel_rx,
@@ -486,9 +489,12 @@ async fn upload_one(
     }
 
     // Multipart upload for large files, with per-part progress and retry.
-    let file = tokio::fs::File::open(disk_path)
-        .await
-        .map_err(|e| format!("open error: {e}"))?;
+    let file = cancelable(&mut cancel_rx, async {
+        tokio::fs::File::open(disk_path)
+            .await
+            .map_err(|e| format!("open error: {e}"))
+    })
+    .await?;
     let mut reader = tokio::io::BufReader::with_capacity(1024 * 1024, file);
     let part_size = part_size_for(size);
 
@@ -606,10 +612,13 @@ async fn upload_parts(
 
         let this_len = part_size.min(size - uploaded) as usize;
         let mut buf = vec![0u8; this_len];
-        reader
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| format!("read error: {e}"))?;
+        cancelable(cancel_rx, async {
+            reader
+                .read_exact(&mut buf)
+                .await
+                .map_err(|e| format!("read error: {e}"))
+        })
+        .await?;
 
         let resp = cancelable(
             cancel_rx,
@@ -945,7 +954,11 @@ async fn upload_files(
                 uploaded_count += 1;
                 if delete_after_upload {
                     if let Err(e) = std::fs::remove_file(&item.path) {
-                        eprintln!("failed to delete {}: {e}", item.path);
+                        // The file is already gone (e.g. the device removed it
+                        // mid-upload) — the goal is achieved, not an error.
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            eprintln!("failed to delete {}: {e}", item.path);
+                        }
                     }
                 }
             }

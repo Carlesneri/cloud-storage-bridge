@@ -139,9 +139,18 @@ function App() {
 
   const [uploading, setUploading] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  const [autoActive, setAutoActive] = useState(false)
+  const autoActiveRef = useRef(false)
   const [destOpen, setDestOpen] = useState(false)
   const [transcodeSet, setTranscodeSet] = useState<Set<string>>(new Set())
   const [deleteAfterUpload, setDeleteAfterUpload] = useState(loadDeletePref)
+  const [autoUpload, setAutoUpload] = useState(false)
+  const autoUploadRef = useRef(false)
+  const secretRef = useRef<string | null>(null)
+  const pendingAutoRef = useRef<MediaFile[]>([])
+  const excludedRef = useRef<Set<string>>(new Set())
+  const uploadingRef = useRef(false)
+  const filesRef = useRef<MediaFile[]>([])
   const [statuses, setStatuses] = useState<Record<string, FileStatus>>({})
   const [skipList, setSkipList] = useState<SkipList>({})
   const [activeKey, setActiveKey] = useState<string | null>(null)
@@ -166,6 +175,26 @@ function App() {
   useEffect(() => {
     localStorage.setItem(DELETE_KEY, deleteAfterUpload ? "1" : "0")
   }, [deleteAfterUpload])
+
+  // Keep refs in sync for the folder-changed listener (avoids stale closures).
+  useEffect(() => { autoUploadRef.current = autoUpload }, [autoUpload])
+  useEffect(() => { autoActiveRef.current = autoActive }, [autoActive])
+  useEffect(() => { excludedRef.current = excluded }, [excluded])
+  useEffect(() => { uploadingRef.current = uploading }, [uploading])
+  useEffect(() => { filesRef.current = files }, [files])
+
+  // Chain auto-uploads: after each batch finishes, upload any remaining
+  // unexcluded files (queued by the watcher or picked up by the re-scan).
+  useEffect(() => {
+    if (uploading || !autoActive) return
+    const pending = pendingAutoRef.current.splice(0)
+    const toUpload = pending.length > 0
+      ? pending
+      : files.filter((f) => !excluded.has(f.path))
+    if (toUpload.length > 0) {
+      startUpload(toUpload)
+    }
+  }, [uploading, autoActive])
 
   // Persist the non-secret settings whenever they change.
   useEffect(() => {
@@ -193,23 +222,37 @@ function App() {
     invoke("start_watching", { path: folder }).catch(() => {})
 
     const unlisten = listen<string>("folder-changed", async () => {
-      if (uploading) return
       try {
         const media = await invoke<MediaFile[]>("scan_folder", { path: folder })
-        let hasChanges = false
-        setFiles((prev) => {
-          const onDisk = new Set(media.map((f) => f.path))
-          const kept = prev.filter((f) => onDisk.has(f.path))
-          const existingPaths = new Set(kept.map((f) => f.path))
-          const added = media.filter((f) => !existingPaths.has(f.path))
-          const next = [...kept, ...added].sort((a, b) => a.relative.localeCompare(b.relative))
-          if (next.length === 0) setScanError("No media files found in this folder.")
-          else if (prev.length === 0) setScanError(null)
-          if (next.length === prev.length && next.every((f, i) => f.path === prev[i].path)) return prev
-          hasChanges = true
-          return next
-        })
-        if (hasChanges) setResult(null)
+        // Compute changes against the current file list synchronously —
+        // state updaters run later, so they can't feed decisions below.
+        const prevFiles = filesRef.current
+        const onDisk = new Set(media.map((f) => f.path))
+        const kept = prevFiles.filter((f) => onDisk.has(f.path))
+        const existingPaths = new Set(kept.map((f) => f.path))
+        const added = media.filter((f) => !existingPaths.has(f.path))
+        const next = [...kept, ...added].sort((a, b) => a.relative.localeCompare(b.relative))
+        if (next.length === 0) setScanError("No media files found in this folder.")
+        else if (prevFiles.length === 0) setScanError(null)
+        const changed = !(next.length === prevFiles.length && next.every((f, i) => f.path === prevFiles[i].path))
+        if (changed) {
+          filesRef.current = next
+          setFiles(next)
+          setResult(null)
+        }
+        if (autoUploadRef.current && autoActiveRef.current && added.length > 0) {
+          // New arrivals are always fresh — clear any stale exclusion.
+          setExcluded((prev) => {
+            const n = new Set(prev)
+            for (const f of added) n.delete(f.path)
+            return n
+          })
+          if (uploadingRef.current) {
+            pendingAutoRef.current.push(...added)
+          } else {
+            startUpload(added)
+          }
+        }
       } catch {
         // ignore scan errors from watcher
       }
@@ -219,7 +262,7 @@ function App() {
       unlisten.then((fn) => fn())
       invoke("stop_watching").catch(() => {})
     }
-  }, [folder, uploading])
+  }, [folder])
 
   const counts = useMemo(() => {
     const c = { all: 0, image: 0, video: 0, audio: 0 } as Record<"all" | MediaKind, number>
@@ -350,6 +393,8 @@ function App() {
 
   async function cancelUpload() {
     if (cancelling) return
+    setAutoActive(false)
+    pendingAutoRef.current = []
     setCancelling(true)
     try {
       await invoke("cancel_upload")
@@ -358,8 +403,27 @@ function App() {
     }
   }
 
-  async function startUpload() {
-    const items: UploadItem[] = selected.map((f) => ({
+  async function startUpload(autoFiles?: MediaFile[]) {
+    // Fetch the secret once, cache it so subsequent auto-uploads don't re-prompt.
+    let secret = config.secret_access_key.trim()
+    if (secret.length === 0) {
+      if (secretRef.current) {
+        secret = secretRef.current
+      } else {
+        const stored = await invoke<string | null>("load_secret").catch<null>(() => null)
+        secret = (stored ?? "").trim()
+        if (secret.length > 0) secretRef.current = secret
+      }
+    }
+    if (secret.length === 0) {
+      setCommandError("Enter your R2 Secret Access Key to upload.")
+      return
+    }
+
+    if (autoUpload) setAutoActive(true)
+    setCancelling(false)
+    const source = autoFiles ?? selected
+    const items: UploadItem[] = source.map((f) => ({
       path: f.path,
       relative: f.relative,
       size: f.size,
@@ -367,20 +431,8 @@ function App() {
     }))
     if (items.length === 0 || uploading) return
 
-    // The secret is stored in the OS keychain, not the React state — fetch it
-    // lazily so a keychain prompt never appears on app launch.
-    let secret = config.secret_access_key.trim()
-    if (secret.length === 0) {
-      const stored = await invoke<string | null>("load_secret").catch<null>(() => null)
-      secret = (stored ?? "").trim()
-    }
-    if (secret.length === 0) {
-      setCommandError("Enter your R2 Secret Access Key to upload.")
-      return
-    }
-
     const initial: Record<string, FileStatus> = {}
-    for (const f of selected) initial[f.path] = { state: "pending", uploaded: 0 }
+    for (const f of source) initial[f.path] = { state: "pending", uploaded: 0 }
     setStatuses(initial)
     setResult(null)
     setCommandError(null)
@@ -485,10 +537,33 @@ function App() {
       setCommandError(String(e))
     } finally {
       for (const u of unlistens) u()
-      setUploading(false)
       setActiveKey(null)
       setCancelling(false)
-      setExcluded(new Set(files.map((f) => f.path)))
+      // Re-scan the folder to sync with disk: removes deleted files
+      // and picks up files that arrived during upload.
+      if (folder) {
+        try {
+          const media = await invoke<MediaFile[]>("scan_folder", { path: folder })
+          const onDisk = new Set(media.map((f) => f.path))
+          setFiles(media)
+          setStatuses((prev) => {
+            const next: Record<string, FileStatus> = {}
+            for (const [k, v] of Object.entries(prev)) {
+              if (onDisk.has(k) && v.state !== "error") next[k] = v
+            }
+            return next
+          })
+          // Exclude processed files so they aren't re-selected.
+          setExcluded((prev) => {
+            const next = new Set(prev)
+            for (const item of items) next.add(item.path)
+            return next
+          })
+        } catch {
+          // ignore scan errors
+        }
+      }
+      setUploading(false)
     }
   }
 
@@ -630,10 +705,10 @@ function App() {
                 ))}
               </div>
               <div className="toolbar-actions">
-                <button className="btn ghost" onClick={() => toggleVisible(true)} disabled={uploading || !!result}>
+                <button className="btn ghost" onClick={() => toggleVisible(true)} disabled={uploading}>
                   Select all
                 </button>
-                <button className="btn ghost" onClick={() => toggleVisible(false)} disabled={uploading || !!result}>
+                <button className="btn ghost" onClick={() => toggleVisible(false)} disabled={uploading}>
                   Deselect all
                 </button>
               </div>
@@ -676,7 +751,7 @@ function App() {
                             type="checkbox"
                             checked={included}
                             onChange={() => toggleFile(f.path)}
-                            disabled={uploading || !!result}
+                            disabled={uploading}
                           />
                         </td>
                         <td className="td-name">
@@ -699,7 +774,7 @@ function App() {
                                   return next
                                 })
                               }
-                              disabled={uploading || !!result}
+                              disabled={uploading}
                               title="Prepare for browser playback (H.264 MP4 + WebVTT subtitles)"
                             />
                           ) : null}
@@ -711,7 +786,7 @@ function App() {
                             role="switch"
                             checked={skipped}
                             onChange={() => (skipped ? unskipFile(f.path) : skipFile(f.path))}
-                            disabled={uploading || !!result}
+                            disabled={uploading}
                             title={skipped ? "Un-skip this file" : "Don't upload this file; remember the choice"}
                           />
                         </td>
@@ -792,7 +867,7 @@ function App() {
         {scanError && <p className="hint">{scanError}</p>}
       </section>
 
-      {files.length > 0 && (
+      {folder && (
         <footer className="upload-bar">
           <div className="upload-meta">
             <strong>
@@ -805,7 +880,7 @@ function App() {
             <div className="progress-fill" style={{ width: `${overallPct}%` }} />
           </div>
           <div className="upload-actions">
-            {uploading ? (
+            {uploading || autoActive ? (
               <>
                 <button className="btn danger" onClick={cancelUpload} disabled={cancelling}>
                   {cancelling ? "Cancelling..." : "Cancel"}
@@ -820,15 +895,25 @@ function App() {
                     disabled
                   />
                 </label>
+                <label className="delete-toggle" title="Automatically upload every new file added to this folder">
+                  Auto upload
+                  <input
+                    type="checkbox"
+                    className="switch"
+                    role="switch"
+                    checked={autoUpload}
+                    disabled
+                  />
+                </label>
               </>
             ) : (
               <>
                 <button
                   className="btn primary"
-                  onClick={startUpload}
-                  disabled={!configValid || selected.length === 0}
+                  onClick={() => startUpload()}
+                  disabled={!configValid || (!autoUpload && selected.length === 0)}
                 >
-                  Upload to R2
+                  {autoUpload ? "Auto Upload" : "Upload to R2"}
                 </button>
                 <label className="delete-toggle" title="Remove files locally after they finish uploading">
                   Delete after upload
@@ -838,6 +923,16 @@ function App() {
                     role="switch"
                     checked={deleteAfterUpload}
                     onChange={(e) => setDeleteAfterUpload(e.target.checked)}
+                  />
+                </label>
+                <label className="delete-toggle" title="Automatically upload every new file added to this folder">
+                  Auto upload
+                  <input
+                    type="checkbox"
+                    className="switch"
+                    role="switch"
+                    checked={autoUpload}
+                    onChange={(e) => setAutoUpload(e.target.checked)}
                   />
                 </label>
               </>
