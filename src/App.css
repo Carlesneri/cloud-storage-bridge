@@ -410,7 +410,7 @@ input[type="checkbox"] {
 .file-header {
   position: sticky;
   top: 0;
-  z-index: 1;
+  z-index: 2;
 }
 
 .file-header th {
@@ -585,6 +585,7 @@ th {
 .upload-bar {
   position: sticky;
   bottom: 12px;
+  z-index: 20;
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 14px;
