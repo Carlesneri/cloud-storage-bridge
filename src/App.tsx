@@ -382,7 +382,7 @@ function App() {
   useEffect(() => {
     if (!folder) return
 
-    invoke("start_watching", { path: folder }).catch(() => {})
+    invoke("start_watching", { path: folder }).catch(() => { })
 
     const unlisten = listen<string>("folder-changed", async () => {
       try {
@@ -415,7 +415,7 @@ function App() {
         // Files vanished while uploading: the backend may be wedged on I/O
         // for one of them. Skip just that file; the batch continues.
         if (kept.length < prevFiles.length && uploadingRef.current) {
-          invoke("skip_current_file").catch(() => {})
+          invoke("skip_current_file").catch(() => { })
         }
         if (autoUploadRef.current && autoActiveRef.current && added.length > 0) {
           // New arrivals are always fresh — clear any stale exclusion, then
@@ -434,7 +434,7 @@ function App() {
 
     return () => {
       unlisten.then((fn) => fn())
-      invoke("stop_watching").catch(() => {})
+      invoke("stop_watching").catch(() => { })
     }
   }, [folder, pushLog])
 
@@ -578,14 +578,23 @@ function App() {
 
   async function cancelUpload() {
     if (cancelling) return
+    const wasUploading = uploadingRef.current
+    const wasAutoActive = autoActiveRef.current
     setAutoActive(false)
     pendingAutoRef.current = []
     setCancelling(true)
     pushLog(folder ? `Cancel clicked — cancelling upload in ${basename(folder)}…` : "Cancel clicked — cancelling upload…")
     try {
       await invoke("cancel_upload")
+      if (!wasUploading && wasAutoActive) {
+        pushLog(folder ? `Upload cancelled — ${basename(folder)}` : "Upload cancelled")
+      }
     } catch (e) {
       pushLog(`Cancel failed — ${String(e)}`)
+    } finally {
+      if (!wasUploading) {
+        setCancelling(false)
+      }
     }
   }
 
@@ -616,11 +625,11 @@ function App() {
     if (source.length === 0) {
       if (autoUpload) {
         const activeToggles: string[] = []
-        if (deleteAfterUpload) activeToggles.push("Delete after upload")
-        if (autoUpload) activeToggles.push("Auto upload")
-        const togglesInfo = activeToggles.length ? activeToggles.join(", ") : "none"
+        if (deleteAfterUpload) activeToggles.push("delete after upload active")
+        if (autoUpload) activeToggles.push("auto upload active")
+        const togglesInfo = activeToggles.join(", ")
         const folderName = folder ? ` in ${basename(folder)}` : ""
-        pushLog(`Upload clicked — Auto upload armed — waiting for new files${folderName} — active toggles: ${togglesInfo}`)
+        pushLog(`Start upload — ${togglesInfo} — waiting for new files${folderName}`)
       }
       return
     }
@@ -641,16 +650,16 @@ function App() {
     setUploading(true)
     uploadingRef.current = true
     {
-      const activeToggles: string[] = []
-      if (deleteAfterUpload) activeToggles.push("Delete after upload")
-      if (autoUpload) activeToggles.push("Auto upload")
-      const togglesInfo = activeToggles.length ? activeToggles.join(", ") : "none"
       const totalBytes = items.reduce((s, i) => s + i.size, 0)
       const folderName = folder ? ` in ${basename(folder)}` : ""
       if (!autoFiles) {
-        pushLog(`Upload clicked — ${items.length} file(s), ${formatBytes(totalBytes)}${folderName} — active toggles: ${togglesInfo}`)
+        const activeToggles: string[] = []
+        if (deleteAfterUpload) activeToggles.push("delete after upload active")
+        if (autoUpload) activeToggles.push("auto upload active")
+        const togglesInfo = activeToggles.length ? activeToggles.join(", ") : "no toggles active"
+        pushLog(`Start upload — ${togglesInfo} - ${items.length} file(s), ${formatBytes(totalBytes)}${folderName}`)
       } else {
-        pushLog(`Init downloading — ${items.length} file(s), ${formatBytes(totalBytes)}${folderName} — active toggles: ${togglesInfo}`)
+        pushLog(`Init downloading — ${items.length} file(s), ${formatBytes(totalBytes)}${folderName}`)
       }
     }
 
@@ -663,14 +672,18 @@ function App() {
       })
       setResult(done)
       if (done.cancelled) {
-        pushLog(`Cancel downloading — ${done.uploaded} uploaded, ${done.failed} failed`)
+        pushLog(`Upload cancelled — ${done.uploaded} uploaded, ${done.failed} failed`)
       } else if (done.failed > 0) {
         pushLog(`Upload finished with errors — ${done.uploaded} uploaded, ${done.failed} failed`)
       }
     } catch (e) {
       const msg = String(e)
       setCommandError(msg)
-      pushLog(`File error — ${msg}`)
+      if (msg.toLowerCase().includes("cancelled") || msg.toLowerCase().includes("canceled")) {
+        pushLog(`Upload cancelled — ${msg}`)
+      } else {
+        pushLog(`File error — ${msg}`)
+      }
     } finally {
       setActiveKey(null)
       setActivePath(null)
