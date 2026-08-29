@@ -1,4 +1,4 @@
-import { useEffect, useRef, useMemo, useState } from "react"
+import { useCallback, useEffect, useRef, useMemo, useState } from "react"
 import logo from "./assets/app-logo.png"
 import { invoke } from "@tauri-apps/api/core"
 import { listen, type UnlistenFn } from "@tauri-apps/api/event"
@@ -97,6 +97,13 @@ interface FileStatus {
   error?: string
 }
 
+interface ActivityEntry {
+  id: number
+  time: string
+  timestamp: number
+  message: string
+}
+
 const DEFAULT_CONFIG: R2Config = {
   account_id: "",
   access_key_id: "",
@@ -117,6 +124,20 @@ function formatBytes(bytes: number): string {
   const units = ["B", "KB", "MB", "GB", "TB"]
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
   return `${(bytes / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`
+}
+
+function basename(path: string): string {
+  const parts = path.split(/[/\\]/)
+  return parts[parts.length - 1] || path
+}
+
+function formatTime(date: Date = new Date()): string {
+  return date.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  })
 }
 
 /** Immutable Set update: copy `prev`, apply `mutate`, return the copy. */
@@ -213,6 +234,22 @@ function App() {
   const [activePath, setActivePath] = useState<string | null>(null)
   const [result, setResult] = useState<UploadDoneEvent | null>(null)
   const [commandError, setCommandError] = useState<string | null>(null)
+  const [activityLog, setActivityLog] = useState<ActivityEntry[]>([])
+  const [logOpen, setLogOpen] = useState(false)
+  const activitySeq = useRef(0)
+
+  const pushLog = useCallback((message: string) => {
+    const now = new Date()
+    setActivityLog((prev) => [
+      ...prev,
+      {
+        id: ++activitySeq.current,
+        time: formatTime(now),
+        timestamp: now.getTime(),
+        message,
+      },
+    ])
+  }, [])
 
   useEffect(() => {
     invoke<R2Config | null>("load_config")
@@ -246,6 +283,7 @@ function App() {
             [e.payload.path]: { ...cur, state: "preparing", action: e.payload.action, preparePct: 0 },
           }
         })
+        pushLog(`Preparing ${e.payload.action} — ${basename(e.payload.path)}`)
       }),
       listen<PrepareProgressEvent>("upload://prepare-progress", (e) => {
         setStatuses((prev) => {
@@ -265,6 +303,7 @@ function App() {
         }))
         setActiveKey(e.payload.key)
         setActivePath(e.payload.path)
+        pushLog(`Uploading: ${basename(e.payload.path)}`)
       }),
       listen<FileProgressEvent>("upload://progress", (e) => {
         setStatuses((prev) => {
@@ -284,6 +323,11 @@ function App() {
         })
         // Once uploaded, the file no longer needs preparation next time.
         setTranscodeSet((prev) => updateSet(prev, (next) => next.delete(e.payload.path)))
+        pushLog(
+          e.payload.warning
+            ? `File uploaded: ${basename(e.payload.path)} — ${e.payload.warning}`
+            : `File uploaded: ${basename(e.payload.path)}`,
+        )
       }),
       listen<FileErrorEvent>("upload://file-error", (e) => {
         setStatuses((prev) => ({
@@ -294,12 +338,17 @@ function App() {
             error: e.payload.error === "cancelled" ? "Cancelled" : e.payload.error,
           },
         }))
+        if (e.payload.error === "cancelled") {
+          pushLog(`File cancelled: ${basename(e.payload.path)}`)
+        } else {
+          pushLog(`File error: ${basename(e.payload.path)} — ${e.payload.error}`)
+        }
       }),
     ]
     return () => {
       Promise.all(subs).then((fns) => fns.forEach((fn) => fn()))
     }
-  }, [])
+  }, [pushLog])
 
   // Keep refs in sync for async callbacks (watcher, pump) that must read
   // fresh values without re-subscribing. One effect covers them all.
@@ -345,6 +394,7 @@ function App() {
         const kept = prevFiles.filter((f) => onDisk.has(f.path))
         const existingPaths = new Set(kept.map((f) => f.path))
         const added = media.filter((f) => !existingPaths.has(f.path))
+        const removed = prevFiles.length - kept.length
         const next = [...kept, ...added].sort((a, b) => a.relative.localeCompare(b.relative))
         if (next.length === 0) setScanError("No media files found in this folder.")
         else if (prevFiles.length === 0) setScanError(null)
@@ -353,6 +403,14 @@ function App() {
           filesRef.current = next
           setFiles(next)
           setResult(null)
+          if (added.length > 0) {
+            const names = added.slice(0, 3).map((f) => basename(f.path)).join(", ")
+            const more = added.length > 3 ? ` +${added.length - 3} more` : ""
+            pushLog(`Folder changed: +${added.length} file(s) — ${names}${more}`)
+          }
+          if (removed > 0) {
+            pushLog(`Folder changed: ${removed} file(s) removed`)
+          }
         }
         // Files vanished while uploading: the backend may be wedged on I/O
         // for one of them. Skip just that file; the batch continues.
@@ -378,7 +436,7 @@ function App() {
       unlisten.then((fn) => fn())
       invoke("stop_watching").catch(() => {})
     }
-  }, [folder])
+  }, [folder, pushLog])
 
   const counts = useMemo(() => {
     const c = { all: 0, image: 0, video: 0, audio: 0 } as Record<"all" | MediaKind, number>
@@ -441,6 +499,7 @@ function App() {
       const path = await invoke<string | null>("select_folder")
       if (!path) return
       setFolder(path)
+      pushLog(`Folder selected: ${basename(path)} — ${path}`)
       setScanning(true)
       setFilter("all")
       const [media, hist, skip] = await Promise.all([
@@ -460,12 +519,16 @@ function App() {
       setFiles(media)
       if (media.length === 0) {
         setScanError("No media files found in this folder.")
+        pushLog(`No media files in: ${basename(path)}`)
+      } else {
+        pushLog(`Found ${media.length} media file(s) in: ${basename(path)}`)
       }
     } catch (e) {
       setFolder(null)
       filesRef.current = []
       setFiles([])
       setScanError(String(e))
+      pushLog(`Folder selection failed — ${String(e)}`)
     } finally {
       setScanning(false)
     }
@@ -489,6 +552,7 @@ function App() {
     setExcluded((prev) => updateSet(prev, (next) => next.add(path)))
     setSkipList((prev) => ({ ...prev, [path]: Math.floor(Date.now() / 1000) }))
     invoke("add_skip", { path }).catch(() => { })
+    pushLog(`Skipped: ${basename(path)}`)
   }
 
   function unskipFile(path: string) {
@@ -498,6 +562,7 @@ function App() {
       return next
     })
     invoke("remove_skip", { path }).catch(() => { })
+    pushLog(`Un-skipped: ${basename(path)}`)
   }
 
   function toggleVisible(check: boolean) {
@@ -516,10 +581,11 @@ function App() {
     setAutoActive(false)
     pendingAutoRef.current = []
     setCancelling(true)
+    pushLog("Cancel requested — cancelling upload…")
     try {
       await invoke("cancel_upload")
-    } catch {
-      // ignore
+    } catch (e) {
+      pushLog(`Cancel failed — ${String(e)}`)
     }
   }
 
@@ -540,7 +606,9 @@ function App() {
 
     const secret = await resolveSecret()
     if (!secret) {
-      setCommandError("Enter your R2 Secret Access Key to upload.")
+      const msg = "Enter your R2 Secret Access Key to upload."
+      setCommandError(msg)
+      pushLog(`Upload failed — ${msg}`)
       return
     }
     // Clicking Auto Upload arms the watcher even with nothing selected yet.
@@ -562,6 +630,7 @@ function App() {
     setCancelling(false)
     setUploading(true)
     uploadingRef.current = true
+    pushLog(`Init downloading — ${items.length} file(s), ${formatBytes(items.reduce((s, i) => s + i.size, 0))}`)
 
     try {
       const done = await invoke<UploadDoneEvent>("upload_files", {
@@ -571,8 +640,17 @@ function App() {
         deleteAfterUpload,
       })
       setResult(done)
+      if (done.cancelled) {
+        pushLog(`Cancel downloading — ${done.uploaded} uploaded, ${done.failed} failed`)
+      } else if (done.failed > 0) {
+        pushLog(`Upload finished with errors — ${done.uploaded} uploaded, ${done.failed} failed`)
+      } else {
+        pushLog(`Upload completed — ${done.uploaded} file(s) uploaded`)
+      }
     } catch (e) {
-      setCommandError(String(e))
+      const msg = String(e)
+      setCommandError(msg)
+      pushLog(`File error — ${msg}`)
     } finally {
       setActiveKey(null)
       setActivePath(null)
@@ -721,7 +799,12 @@ function App() {
 
       <section className="card">
         <div className="folder-row">
-          <button className="btn secondary" onClick={pickFolder} disabled={uploading || scanning}>
+          <button
+            className="btn secondary"
+            onClick={pickFolder}
+            disabled={uploading || autoActive || scanning}
+            title={uploading || autoActive ? "Cancel upload first to change folder" : undefined}
+          >
             {scanning ? "Scanning..." : folder ? "Change Folder..." : "Choose Folder..."}
           </button>
           {folder && (
@@ -854,7 +937,12 @@ function App() {
                             onClick={async () => {
                               const ok = window.confirm(`Delete ${f.relative}?\nThis cannot be undone.`)
                               if (!ok) return
-                              await invoke("delete_file", { path: f.path })
+                              try {
+                                await invoke("delete_file", { path: f.path })
+                                pushLog(`File deleted: ${f.relative}`)
+                              } catch (e) {
+                                pushLog(`Delete failed: ${f.relative} — ${String(e)}`)
+                              }
                               filesRef.current = filesRef.current.filter((x) => x.path !== f.path)
                               setFiles(filesRef.current)
                               if (filesRef.current.length === 0) {
@@ -925,8 +1013,63 @@ function App() {
             />
             <span className="pct">{overallPct}%</span>
           </div>
-          {result && (
-            <p className={`summary ${result.failed > 0 ? "warn" : "ok"}`}>
+          {/* Activity / info message — shows last action state */}
+          <div className="activity-bar">
+            <div className="activity-last" title={activityLog.length ? `${activityLog[activityLog.length - 1].time} — ${activityLog[activityLog.length - 1].message}` : undefined}>
+              {activityLog.length === 0 ? (
+                <span className="activity-empty">No activity yet</span>
+              ) : (
+                <>
+                  <span className="activity-time">{activityLog[activityLog.length - 1].time}</span>
+                  <span className="activity-msg">{activityLog[activityLog.length - 1].message}</span>
+                </>
+              )}
+            </div>
+            <button
+              className={`btn ghost log-toggle ${logOpen ? "log-toggle-open" : ""}`}
+              onClick={() => setLogOpen((o) => !o)}
+              aria-expanded={logOpen}
+              aria-label={logOpen ? "Hide activity log" : "Show activity log"}
+              title={logOpen ? "Hide activity log" : `Show activity log (${activityLog.length})`}
+              disabled={activityLog.length === 0}
+            >
+              {/* list icon */}
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <line x1="8" y1="6" x2="21" y2="6" />
+                <line x1="8" y1="12" x2="21" y2="12" />
+                <line x1="8" y1="18" x2="21" y2="18" />
+                <line x1="3" y1="6" x2="3.01" y2="6" />
+                <line x1="3" y1="12" x2="3.01" y2="12" />
+                <line x1="3" y1="18" x2="3.01" y2="18" />
+              </svg>
+              {activityLog.length > 0 && <span className="log-count">{activityLog.length}</span>}
+            </button>
+          </div>
+          {logOpen && (
+            <div className="activity-log">
+              <div className="activity-log-header">
+                <span className="activity-log-title">Activity log</span>
+                <button className="btn ghost btn-sm" onClick={() => setActivityLog([])} disabled={activityLog.length === 0}>
+                  Clear
+                </button>
+              </div>
+              <ul className="activity-list">
+                {activityLog.length === 0 ? (
+                  <li className="activity-entry activity-empty">No entries</li>
+                ) : (
+                  [...activityLog].reverse().map((entry) => (
+                    <li key={entry.id} className="activity-entry">
+                      <span className="activity-entry-time">{entry.time}</span>
+                      <span className="activity-entry-msg">{entry.message}</span>
+                    </li>
+                  ))
+                )}
+              </ul>
+            </div>
+          )}
+          {/* keep result/commandError accessible but already reflected in log; hidden summaries for compat */}
+          {result && !logOpen && (
+            <p className={`summary ${result.failed > 0 ? "warn" : "ok"}`} style={{ display: "none" }}>
               {result.cancelled
                 ? `Cancelled. ${result.uploaded} uploaded, ${result.failed} failed.`
                 : result.failed > 0
@@ -934,7 +1077,7 @@ function App() {
                   : `Done. ${result.uploaded} file${result.uploaded === 1 ? "" : "s"} uploaded.`}
             </p>
           )}
-          {commandError && <p className="summary warn">{commandError}</p>}
+          {commandError && !logOpen && <p className="summary warn" style={{ display: "none" }}>{commandError}</p>}
         </footer>
       )}
     </main>
