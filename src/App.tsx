@@ -581,7 +581,7 @@ function App() {
     setAutoActive(false)
     pendingAutoRef.current = []
     setCancelling(true)
-    pushLog("Cancel requested — cancelling upload…")
+    pushLog(folder ? `Cancel clicked — cancelling upload in ${basename(folder)}…` : "Cancel clicked — cancelling upload…")
     try {
       await invoke("cancel_upload")
     } catch (e) {
@@ -613,7 +613,17 @@ function App() {
     }
     // Clicking Auto Upload arms the watcher even with nothing selected yet.
     if (autoUpload) setAutoActive(true)
-    if (source.length === 0) return
+    if (source.length === 0) {
+      if (autoUpload) {
+        const activeToggles: string[] = []
+        if (deleteAfterUpload) activeToggles.push("Delete after upload")
+        if (autoUpload) activeToggles.push("Auto upload")
+        const togglesInfo = activeToggles.length ? activeToggles.join(", ") : "none"
+        const folderName = folder ? ` in ${basename(folder)}` : ""
+        pushLog(`Upload clicked — Auto upload armed — waiting for new files${folderName} — active toggles: ${togglesInfo}`)
+      }
+      return
+    }
 
     const items: UploadItem[] = source.map((f) => ({
       path: f.path,
@@ -630,7 +640,19 @@ function App() {
     setCancelling(false)
     setUploading(true)
     uploadingRef.current = true
-    pushLog(`Init downloading — ${items.length} file(s), ${formatBytes(items.reduce((s, i) => s + i.size, 0))}`)
+    {
+      const activeToggles: string[] = []
+      if (deleteAfterUpload) activeToggles.push("Delete after upload")
+      if (autoUpload) activeToggles.push("Auto upload")
+      const togglesInfo = activeToggles.length ? activeToggles.join(", ") : "none"
+      const totalBytes = items.reduce((s, i) => s + i.size, 0)
+      const folderName = folder ? ` in ${basename(folder)}` : ""
+      if (!autoFiles) {
+        pushLog(`Upload clicked — ${items.length} file(s), ${formatBytes(totalBytes)}${folderName} — active toggles: ${togglesInfo}`)
+      } else {
+        pushLog(`Init downloading — ${items.length} file(s), ${formatBytes(totalBytes)}${folderName} — active toggles: ${togglesInfo}`)
+      }
+    }
 
     try {
       const done = await invoke<UploadDoneEvent>("upload_files", {
