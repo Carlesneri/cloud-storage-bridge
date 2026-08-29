@@ -644,8 +644,6 @@ function App() {
         pushLog(`Cancel downloading — ${done.uploaded} uploaded, ${done.failed} failed`)
       } else if (done.failed > 0) {
         pushLog(`Upload finished with errors — ${done.uploaded} uploaded, ${done.failed} failed`)
-      } else {
-        pushLog(`Upload completed — ${done.uploaded} file(s) uploaded`)
       }
     } catch (e) {
       const msg = String(e)
@@ -1034,7 +1032,7 @@ function App() {
               disabled={activityLog.length === 0}
             >
               {/* list icon */}
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <line x1="8" y1="6" x2="21" y2="6" />
                 <line x1="8" y1="12" x2="21" y2="12" />
                 <line x1="8" y1="18" x2="21" y2="18" />
@@ -1042,7 +1040,6 @@ function App() {
                 <line x1="3" y1="12" x2="3.01" y2="12" />
                 <line x1="3" y1="18" x2="3.01" y2="18" />
               </svg>
-              {activityLog.length > 0 && <span className="log-count">{activityLog.length}</span>}
             </button>
           </div>
           {logOpen && (
